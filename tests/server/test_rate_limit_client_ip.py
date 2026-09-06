@@ -4,8 +4,11 @@ import pytest
 from starlette.requests import Request
 
 from chessshootout.server.app import (
+    RECLAIM_PER_IP_LIMIT, RECLAIM_PER_UUID_LIMIT_PER_MINUTE, RESUME_PER_IP_LIMIT,
     _parse_trusted_proxies, _peer_trusted, client_ip_key,
 )
+from chessshootout.server.protocol import PROTOCOL_VERSION, Reason
+from tests.helpers import fake_uuid4
 
 TRUSTED = [ipaddress.ip_network("172.28.0.0/16")]
 
@@ -76,3 +79,47 @@ def test_client_ip_key_trusts_cf_header_from_loopback_under_default_config():
     trusted = _parse_trusted_proxies("127.0.0.1/32")
     req = make_request("127.0.0.1", {"cf-connecting-ip": "1.2.3.4"})
     assert client_ip_key(req, trusted) == "1.2.3.4"
+
+
+def _limit_count(limit):
+    return int(limit.split("/")[0])
+
+
+def test_resume_is_rate_limited_per_ip(client):
+    """The @limiter.limit decorator on POST /resume had no coverage at all: the
+    key function above was tested, the endpoint binding was not. A resume that is
+    refused because the room does not exist still SPENDS allowance -- the limiter
+    runs in front of the handler -- which is what makes the endpoint a cheap
+    unauthenticated way to hammer the room lookup if the decorator ever came off.
+
+    The 404s are the point: every one of the first 60 reached the handler."""
+    budget = _limit_count(RESUME_PER_IP_LIMIT)
+    payload = {"version": PROTOCOL_VERSION, "room_id": fake_uuid4(4242),
+               "session_token": "nope"}
+    for _ in range(budget):
+        assert client.post("/resume", json=payload).status_code == 404
+    limited = client.post("/resume", json=payload)
+    assert limited.status_code == 429
+    assert limited.json()["detail"]["reason"] == Reason.RATE_LIMITED
+
+
+def test_reclaim_is_rate_limited_per_ip_beyond_the_per_uuid_limiter(client):
+    """/reclaim carries TWO limiters -- a per-uuid one inside the handler and the
+    per-IP decorator around it -- and only the per-uuid one was covered. Every
+    call here uses a DISTINCT uuid so the inner limiter (100/minute per id) can
+    never be the thing that answers 429; the refusal past 120 can only have come
+    from the per-IP decorator.
+
+    That ordering matters: the per-uuid limiter is what a single stolen id costs,
+    the per-IP one is what one host costs however many ids it invents."""
+    assert _limit_count(RECLAIM_PER_IP_LIMIT) > RECLAIM_PER_UUID_LIMIT_PER_MINUTE, \
+        "distinct uuids only prove the per-IP cap while it is the higher of the two"
+    budget = _limit_count(RECLAIM_PER_IP_LIMIT)
+    for i in range(budget):
+        r = client.post("/reclaim", json={"version": PROTOCOL_VERSION,
+                                          "client_uuid": fake_uuid4(5000 + i)})
+        assert r.status_code == 404, f"call {i} should reach the handler"
+    limited = client.post("/reclaim", json={"version": PROTOCOL_VERSION,
+                                            "client_uuid": fake_uuid4(5000 + budget)})
+    assert limited.status_code == 429
+    assert limited.json()["detail"]["reason"] == Reason.RATE_LIMITED

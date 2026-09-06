@@ -3,13 +3,28 @@ mate landing at the same instant must not double-broadcast a contradictory
 result) and the broadcast-send-failure -> mark_disconnected seam (a socket
 that throws on send must not be left looking "connected" until the next
 heartbeat sweep notices, ~HEARTBEAT_TIMEOUT_SECONDS later).
+
+Plus the static half of the same invariant: finalize_and_broadcast is the ONE
+place a result is written, and the AST guard at the bottom is what keeps it
+that way.
 """
+import ast
+import os
+
 import pytest
 
+import chessshootout
 from chessshootout.server.broadcasts import finalize_and_broadcast, push_idle_window
 from chessshootout.server.connections import broadcast
 from chessshootout.server.protocol import PROTOCOL_VERSION, Reason, ResultMessage
+from chessshootout.server.rooms import RoomManager
+from tests.helpers import read_source_without_docstrings
 from tests.server.conftest import ALICE, BOB
+
+PACKAGE_ROOT = os.path.dirname(os.path.abspath(chessshootout.__file__))
+REPO_ROOT = os.path.dirname(PACKAGE_ROOT)
+SERVER_ROOT = os.path.join(PACKAGE_ROOT, "server")
+FINALIZE_CALLER = "chessshootout/server/broadcasts.py"
 
 
 class RecordingWS:
@@ -141,3 +156,48 @@ async def test_push_idle_window_bails_on_a_backend_less_room(app, clock):
     await push_idle_window(rooms, app.state.connections, room, clock(), force=True)
 
     assert room.idle_pushed_at is None
+
+
+def _finalize_result_call_lines(path):
+    tree = ast.parse(read_source_without_docstrings(path), filename=path)
+    lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name == "finalize_result":
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_finalize_result_is_called_from_broadcasts_and_nowhere_else():
+    """RoomManager.finalize_result writes room.result and awards the series
+    point, and it is deliberately NOT the public way to end a game:
+    finalize_and_broadcast wraps it, and only broadcasts when its own call was
+    the one that applied (the losing side of the race above stays silent).
+
+    A second caller anywhere under server/ would be a result that lands on the
+    room without ever reaching the players — the exact shape of the race this
+    file exists for. AST rather than a text scan, so `finalize_result` in prose
+    or in the `def` at rooms.py cannot register as a call.
+    """
+    assert callable(RoomManager.finalize_result), \
+        "guard is keyed on the name; a rename must be made loud, not silent"
+    assert os.path.isdir(SERVER_ROOT), f"expected a walkable package dir at {SERVER_ROOT}"
+    callers = {}
+    scanned = 0
+    for dirpath, _, filenames in os.walk(SERVER_ROOT):
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            scanned += 1
+            lines = _finalize_result_call_lines(path)
+            if lines:
+                callers[os.path.relpath(path, REPO_ROOT)] = lines
+    assert scanned >= 8, f"only scanned {scanned} files, guard root is likely wrong"
+    assert sorted(callers) == [FINALIZE_CALLER], \
+        f"finalize_result must be called only from broadcasts.py, found {callers}"
+    assert len(callers[FINALIZE_CALLER]) == 1, \
+        f"and exactly once inside it, found {callers[FINALIZE_CALLER]}"

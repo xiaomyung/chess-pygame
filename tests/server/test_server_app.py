@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 import sys
 
@@ -6,10 +7,13 @@ import pytest
 
 from chessshootout.server import __main__ as server_main
 from fastapi import WebSocketDisconnect
+from fastapi.testclient import TestClient
+from slowapi import Limiter
 
 from chessshootout.server.app import (
     MATCHMAKE_PER_IP_LIMIT, MAX_INBOUND_MESSAGE_BYTES, PROTOCOL_VERSION,
-    WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE, WS_CLOSE_SUPERSEDED,
+    UuidRateLimiter, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
+    WS_CLOSE_SUPERSEDED, create_app,
 )
 from chessshootout.server.broadcasts import idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
@@ -23,8 +27,9 @@ from chessshootout.server.protocol import (
     MAX_INCREMENT_SECONDS, MAX_TIME_MINUTES, MIN_INCREMENT_SECONDS,
     MIN_TIME_MINUTES, Reason,
 )
-from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS
-from tests.helpers import fake_uuid4
+from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
+from chessshootout.server.sweep import Sweep
+from tests.helpers import FakeClock, fake_uuid4
 from tests.server.conftest import ALICE, BOB, auth_msg
 from tests.server.test_server_broadcasts import RecordingWS
 
@@ -55,6 +60,46 @@ def test_registry_remove_is_identity_guarded():
 def test_registry_remove_unknown_room_returns_false():
     reg = ConnectionRegistry()
     assert reg.remove("nope", "u", object()) is False
+
+
+APP_STATE_TYPES = {
+    "rooms": RoomManager,
+    "connections": ConnectionRegistry,
+    "limiter": Limiter,
+    "started_at": float,
+    "reclaim_limiter": UuidRateLimiter,
+    "annotation_limiter": UuidRateLimiter,
+    "chat_limiter": UuidRateLimiter,
+    "moderation_enabled": bool,
+    "sweep": Sweep,
+}
+PER_APP_OBJECTS = ("rooms", "connections", "limiter", "reclaim_limiter",
+                   "annotation_limiter", "chat_limiter")
+
+
+def test_app_state_carries_every_shared_service(app):
+    """create_app's contract with everything downstream of it: eleven names on
+    app.state, of the right kinds. Every handler, the sweep loop and the ws
+    session reach their collaborators through exactly these, so a rename or a
+    dropped assignment is a runtime AttributeError deep inside a request rather
+    than an import error at boot."""
+    for name, expected in APP_STATE_TYPES.items():
+        value = getattr(app.state, name)
+        assert isinstance(value, expected), f"app.state.{name} is a {type(value).__name__}"
+    assert callable(app.state.now), "the injected monotonic clock"
+    assert callable(app.state.now_ms), "and the same clock in milliseconds"
+    assert app.state.now_ms() == pytest.approx(app.state.now() * 1000.0)
+
+
+def test_two_apps_share_no_mutable_state():
+    """Nothing built in create_app may live at module scope. Two apps in one
+    process -- which is exactly what the test suite is, a couple of hundred of
+    them -- must not see each other's rooms, sockets or spent allowances."""
+    a = create_app(now_provider=FakeClock(), max_rooms=8)
+    b = create_app(now_provider=FakeClock(), max_rooms=8)
+    for name in PER_APP_OBJECTS:
+        assert getattr(a.state, name) is not getattr(b.state, name), \
+            f"app.state.{name} is shared between two applications"
 
 
 CARL = fake_uuid4(3)
@@ -274,6 +319,28 @@ def test_search_and_cancel_share_one_matchmake_budget(client):
         assert client.request("DELETE", "/matchmake", json=payload).status_code == 404
     assert _matchmake(client, uuid=ALICE).status_code == 200
     assert _matchmake(client, uuid=BOB).status_code == 429
+
+
+def test_two_apps_never_share_a_per_ip_matchmake_budget(client):
+    """The per-IP limiter is a `Limiter` built inside create_app and bound by the
+    @limiter.limit decorator, so its allowance belongs to ONE application. If the
+    decorator ever closed over a module-level limiter instead, every test app in
+    the process would draw on one wall-clock budget and the suite would start
+    failing in whichever order it happened to run.
+
+    The fill uses a single uuid on purpose: each POST releases the caller's own
+    queue slot before enqueueing again, so 60 searches spend 60 allowance without
+    ever holding more than one room."""
+    budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
+    for _ in range(budget):
+        assert _matchmake(client, uuid=ALICE).status_code == 200
+    limited = _matchmake(client, uuid=ALICE)
+    assert limited.status_code == 429
+    assert limited.json()["detail"]["reason"] == Reason.RATE_LIMITED
+
+    other = TestClient(create_app(now_provider=FakeClock(), max_rooms=8))
+    assert _matchmake(other, uuid=ALICE).status_code == 200, \
+        "a second application starts with its own untouched allowance"
 
 
 def test_cancel_with_bogus_token_rejected(client):
@@ -496,6 +563,95 @@ def test_rematch_decline_notifies_offerer(client):
                                         "type": "rematch_response", "accept": False}))
             upd = _recv(ws_w)
             assert upd["type"] == "rematch_update" and upd["event"] == "declined"
+
+
+def _auth(ws, body):
+    ws.send_text(json.dumps(auth_msg(body["session_token"])))
+
+
+def test_a_rematch_reroutes_heartbeats_and_the_teardown_to_the_new_color(
+    app, client, clock,
+):
+    """A rematch swaps the colours underneath two sockets that never dropped, so
+    the session loop re-reads `room.color_of(uuid)` on every frame instead of
+    trusting the colour it authenticated with. Both consumers of that re-read are
+    pinned here: the per-frame `touch_seen` (which is what keeps the heartbeat
+    timeout off a live player) and the teardown's `mark_disconnected`.
+
+    Alice authenticates as white and ends the rematch as black; if either site
+    still used the auth-time colour, Bob's seat would be the one stamped -- and
+    Alice would be swept as silent while typing.
+    """
+    random.seed(0)
+    r1 = _matchmake(client, uuid=ALICE, side="white")
+    r2 = _matchmake(client, uuid=BOB, side="black")
+    room = app.state.rooms.get(r1.json()["room_id"])
+    with client.websocket_connect(f"/ws/{r2.json()['room_id']}") as ws_b:
+        _auth(ws_b, r2.json())
+        with client.websocket_connect(f"/ws/{r1.json()['room_id']}") as ws_w:
+            _auth(ws_w, r1.json())
+            assert _recv(ws_w)["type"] == "game_start"
+            assert _recv(ws_b)["type"] == "game_start"
+            ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION, "type": "resign"}))
+            _recv(ws_w)
+            _recv(ws_b)
+            ws_b.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                       "type": "rematch_request"}))
+            assert _recv(ws_w)["type"] == "rematch_request"
+            ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                       "type": "rematch_response", "accept": True}))
+            assert _recv(ws_w)["your_color"] == "black"
+            assert _recv(ws_b)["your_color"] == "white"
+            assert room.black.client_uuid == ALICE, "alice now sits in the black seat"
+
+            clock.advance(5)
+            ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                       "type": "ping", "ply": 0}))
+            assert _recv(ws_w)["type"] == "pong"
+
+            assert room.black.last_seen == pytest.approx(5.0), \
+                "alice's heartbeat stamps the seat she holds NOW"
+            assert room.white.last_seen == pytest.approx(0.0), \
+                "and never bob's, whose colour she merely authenticated as"
+
+        notice = _recv(ws_b)
+        assert notice["type"] == "connection_status"
+        assert notice["opp_state"] == "reconnecting"
+        assert room.black.connected is False, "the teardown marks the seat she holds NOW"
+        assert room.white.connected is True, "bob's own socket is still up"
+
+
+def test_a_socket_whose_seat_vanishes_falls_back_to_its_auth_color(app, client, caplog):
+    """The `or auth_color` fallback in the session teardown. `color_of` answers
+    None once the room no longer seats that player, and the teardown still has to
+    mark, log and notify -- a KeyError or a `None` colour here would strand the
+    opponent on a board that never says "reconnecting".
+
+    Emptying the seat under a live socket is the shape that reaches it: the next
+    frame breaks the loop with no current colour, and the auth-time colour is the
+    only identity left to report."""
+    random.seed(0)
+    r1 = _matchmake(client, uuid=ALICE, side="white")
+    r2 = _matchmake(client, uuid=BOB, side="black")
+    room = app.state.rooms.get(r1.json()["room_id"])
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        with client.websocket_connect(f"/ws/{r2.json()['room_id']}") as ws_b:
+            _auth(ws_b, r2.json())
+            with client.websocket_connect(f"/ws/{r1.json()['room_id']}") as ws_w:
+                _auth(ws_w, r1.json())
+                assert _recv(ws_w)["type"] == "game_start"
+                assert _recv(ws_b)["type"] == "game_start"
+                room.white = None
+                assert room.color_of(ALICE) is None
+                ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                           "type": "ping", "ply": 0}))
+            notice = _recv(ws_b)
+
+    assert notice["type"] == "connection_status"
+    assert notice["opp_state"] == "reconnecting"
+    assert f"ws disconnected room={room.room_id} color=white" in [
+        r.getMessage() for r in caplog.records], \
+        "the breadcrumb names the colour the socket authenticated as"
 
 
 def test_out_of_turn_move_rejected(client):

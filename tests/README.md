@@ -53,8 +53,8 @@ Tests mirror the source layout, five dirs under `tests/`:
 - `tests/infra/` — cross-cutting app lifecycle/config: `paths`, `env`,
   `countries`, `icons`, `log_format`, `crash_log`, `migration`, `utf8`, plus
   whole-repo static guards (`imports`, `logging_hygiene`,
-  `server_no_pygame`, `docstring_guard`) that scan the source tree rather than
-  exercise one module.
+  `server_no_pygame`, `server_layering`, `docstring_guard`) that scan the source
+  tree rather than exercise one module.
 
 **Where does a new test go?** By the primary module under test — what the
 asserts verify, not an incidental import. A file that drives a real
