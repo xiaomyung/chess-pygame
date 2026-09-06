@@ -3,7 +3,7 @@ import ipaddress
 import pytest
 from starlette.requests import Request
 
-from chessshootout.server.app import (
+from chessshootout.server.limits import (
     RECLAIM_PER_IP_LIMIT, RECLAIM_PER_UUID_LIMIT_PER_MINUTE, RESUME_PER_IP_LIMIT,
     _parse_trusted_proxies, _peer_trusted, client_ip_key,
 )
@@ -65,9 +65,9 @@ def test_client_ip_key_uses_loopback_when_request_has_no_client():
 
 
 def test_client_ip_key_defaults_to_module_trusted_proxies(monkeypatch):
-    import chessshootout.server.app as app_module
+    import chessshootout.server.limits as limits_module
     monkeypatch.setattr(
-        app_module, "TRUSTED_PROXIES", [ipaddress.ip_network("10.1.0.0/16")],
+        limits_module, "TRUSTED_PROXIES", [ipaddress.ip_network("10.1.0.0/16")],
     )
     trusted_req = make_request("10.1.2.3", {"cf-connecting-ip": "9.9.9.9"})
     untrusted_req = make_request("8.8.8.8", {"cf-connecting-ip": "9.9.9.9"})

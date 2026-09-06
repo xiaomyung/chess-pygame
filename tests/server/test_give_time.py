@@ -15,7 +15,7 @@ import pytest
 from tests.conftest import pygame_display
 from chessshootout.domain.match import ONLINE
 from chessshootout.backend.pieces import PieceColor
-from chessshootout.server.app import PROTOCOL_VERSION
+from chessshootout.server.protocol import PROTOCOL_VERSION
 from tests.server.conftest import ALICE, BOB, auth_msg
 
 

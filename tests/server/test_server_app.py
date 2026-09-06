@@ -12,11 +12,9 @@ from fastapi.testclient import TestClient
 from slowapi import Limiter
 
 from chessshootout.server import app as app_module
-from chessshootout.server.app import (
-    MATCHMAKE_PER_IP_LIMIT, MAX_INBOUND_MESSAGE_BYTES, PROTOCOL_VERSION,
-    UuidRateLimiter, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
-    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED, _sweep_loop, create_app,
-)
+from chessshootout.server.app import _sweep_loop, create_app
+from chessshootout.server.limits import MATCHMAKE_PER_IP_LIMIT, UuidRateLimiter
+from chessshootout.server.ws_session import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.server.broadcasts import broadcast_game_start, idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
 from chessshootout.server.handlers import (
@@ -30,7 +28,8 @@ from chessshootout.server.protocol import (
     HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS, HealthStatus,
     CLIENT_VERSION_MAX_LEN, IDLE_RESIGN_SECONDS, MAX_INCREMENT_SECONDS,
     MAX_TIME_MINUTES, MIN_CLIENT_VERSION, MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES,
-    Reason,
+    PROTOCOL_VERSION, Reason, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
+    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED,
 )
 from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
 from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
@@ -622,6 +621,39 @@ def test_two_apps_never_share_a_per_ip_matchmake_budget(client):
     other = TestClient(create_app(now_provider=FakeClock(), max_rooms=8))
     assert _matchmake(other, uuid=ALICE).status_code == 200, \
         "a second application starts with its own untouched allowance"
+
+
+def test_two_apps_each_authenticate_on_their_own_websocket_router():
+    """The websocket route lives on a MODULE-LEVEL router shared by every
+    application in the process -- unlike the HTTP router, which is rebuilt per app
+    because its limiter decorators must not share a budget. That is only safe
+    while the endpoint reads its application off the live connection instead of
+    closing over one: two apps must each pair and authenticate their own players,
+    and a token minted by one must mean nothing to the other."""
+    apps = [create_app(now_provider=FakeClock(), max_rooms=8) for _ in range(2)]
+    clients = [TestClient(a) for a in apps]
+    sessions = []
+    for c in clients:
+        random.seed(0)
+        white = _matchmake(c, uuid=ALICE, side="white").json()
+        black = _matchmake(c, uuid=BOB, side="black").json()
+        assert white["room_id"] == black["room_id"]
+        sessions.append((white, black))
+    assert sessions[0][0]["room_id"] != sessions[1][0]["room_id"]
+
+    for c, (white, black) in zip(clients, sessions):
+        with c.websocket_connect(f"/ws/{white['room_id']}") as ws_w:
+            ws_w.send_text(json.dumps(auth_msg(white["session_token"])))
+            with c.websocket_connect(f"/ws/{black['room_id']}") as ws_b:
+                ws_b.send_text(json.dumps(auth_msg(black["session_token"])))
+                assert json.loads(ws_w.receive_text())["type"] == "game_start"
+                assert json.loads(ws_b.receive_text())["type"] == "game_start"
+
+    foreign = sessions[0][0]
+    with clients[1].websocket_connect(f"/ws/{foreign['room_id']}") as ws:
+        ws.send_text(json.dumps(auth_msg(foreign["session_token"])))
+        with pytest.raises(Exception):
+            ws.receive_text()
 
 
 def test_cancel_with_bogus_token_rejected(client):

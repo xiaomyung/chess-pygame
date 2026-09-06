@@ -16,9 +16,9 @@ import contextlib
 import json
 import random
 
-from chessshootout.server.app import PROTOCOL_VERSION
 from chessshootout.server.protocol import (
-    CHAT_PRESET_COUNT, MAX_SHARED_ARROWS, MAX_SHARED_HIGHLIGHTS, Reason)
+    CHAT_PRESET_COUNT, MAX_SHARED_ARROWS, MAX_SHARED_HIGHLIGHTS, PROTOCOL_VERSION,
+    Reason)
 from tests.server.conftest import ALICE, BOB, auth_msg
 
 
@@ -431,7 +431,7 @@ def test_resume_snapshot_is_taken_before_opponent_notify(client, monkeypatch):
     mutates the room mid-await (applies a move, sets a result, clears marks); a
     read placed after the await would leak that newer state and tear fen away from
     the history it was captured with. Pins the torn-snapshot fix."""
-    import chessshootout.server.app as app_mod
+    import chessshootout.server.routes_http as routes_mod
     from chessshootout.backend.fen import export_fen
     from chessshootout.backend.utils import square_from_coord
 
@@ -459,7 +459,7 @@ def test_resume_snapshot_is_taken_before_opponent_notify(client, monkeypatch):
     pre_ply = len(room.backend.move_history)
 
     state = {"fired": False}
-    real_send = app_mod.send
+    real_send = routes_mod.send
 
     async def mutating_send(ws, message):
         if not state["fired"]:
@@ -469,7 +469,7 @@ def test_resume_snapshot_is_taken_before_opponent_notify(client, monkeypatch):
             room.annotations_white.clear_marks()
         return await real_send(ws, message)
 
-    monkeypatch.setattr(app_mod, "send", mutating_send)
+    monkeypatch.setattr(routes_mod, "send", mutating_send)
 
     r = client.post("/resume", json={
         "version": PROTOCOL_VERSION, "room_id": a["room_id"],

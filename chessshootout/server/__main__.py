@@ -5,9 +5,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from chessshootout.server import logging_setup
-from chessshootout.server.app import (
-    create_app, DEFAULT_MAX_ROOMS, MAX_INBOUND_MESSAGE_BYTES,
-)
+from chessshootout.server.app import create_app, DEFAULT_MAX_ROOMS
+from chessshootout.server.ws_session import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.infra.log_format import uvicorn_log_config
 
 

@@ -550,7 +550,7 @@ async def test_pending_start_ms_is_stamped_in_milliseconds(app, clock):
 
 
 def _resume_payload(app, room, color):
-    from chessshootout.server.app import _pending_skillcheck_wire
+    from chessshootout.server.routes_http import _pending_skillcheck_wire
     return _pending_skillcheck_wire(room, app.state.now_ms)
 
 

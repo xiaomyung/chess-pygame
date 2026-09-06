@@ -5,7 +5,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from chessshootout.server.app import PROTOCOL_VERSION, create_app
+from chessshootout.server.app import create_app
+from chessshootout.server.protocol import PROTOCOL_VERSION
 from tests.helpers import FakeClock, fake_uuid4
 
 
