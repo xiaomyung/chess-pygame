@@ -167,6 +167,15 @@ def _ping(ply):
     return {"version": PROTOCOL_VERSION, "type": "ping", "ply": ply}
 
 
+def _pongs(ws, count):
+    """Frames off one socket up to and including its `count`-th pong. Per-connection
+    FIFO makes this deterministic; a marker sent on the OTHER socket is not."""
+    seen = []
+    while sum(m["type"] == "pong" for m in seen) < count:
+        seen.append(json.loads(ws.receive_text()))
+    return seen
+
+
 def _past_the_transit_grace(clock):
     """Pairing runs the real broadcast_game_start, which stamps a history change
     at the fake clock's frozen zero -- and a stamp with no previous length
@@ -231,10 +240,9 @@ def test_a_heartbeat_racing_the_opponents_move_is_not_a_desync(client, clock):
 
             for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS + 2):
                 ws_b.send_text(json.dumps(_ping(0)))
-            ws_w.send_text(json.dumps(_quick_chat()))
+            ws_b.send_text(json.dumps(_ping(1)))
 
-            seen = [m["type"] for m in _drain_until_chat(ws_b)]
-            assert seen.count("pong") == RESYNC_STABLE_MISMATCH_HEARTBEATS + 2
+            seen = [m["type"] for m in _pongs(ws_b, RESYNC_STABLE_MISMATCH_HEARTBEATS + 3)]
             assert "resync_directive" not in seen
 
 
@@ -264,10 +272,9 @@ def test_a_heartbeat_racing_a_takeback_is_not_a_desync(client, clock):
 
             for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS + 2):
                 ws_w.send_text(json.dumps(_ping(1)))
-            ws_b.send_text(json.dumps(_quick_chat()))
+            ws_w.send_text(json.dumps(_ping(0)))
 
-            seen = [m["type"] for m in _drain_until_chat(ws_w)]
-            assert seen.count("pong") == RESYNC_STABLE_MISMATCH_HEARTBEATS + 2
+            seen = [m["type"] for m in _pongs(ws_w, RESYNC_STABLE_MISMATCH_HEARTBEATS + 3)]
             assert "resync_directive" not in seen
 
 
@@ -278,7 +285,10 @@ def _quick_chat():
 def _drain_until_chat(ws):
     """Sentinel drain: quick_chat is relayed straight through with no state of
     its own, so the frame after it is a hard end-of-stream marker -- everything
-    the flapping pings produced has to arrive ahead of it."""
+    the flapping pings produced has to arrive ahead of it, PROVIDED the sentinel
+    is sent on the SAME socket as those pings; per-connection FIFO is what
+    orders it after them, and a marker sent on the other socket proves
+    nothing."""
     seen = []
     while True:
         msg = json.loads(ws.receive_text())

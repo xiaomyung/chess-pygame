@@ -652,8 +652,9 @@ def test_two_apps_each_authenticate_on_their_own_websocket_router():
     foreign = sessions[0][0]
     with clients[1].websocket_connect(f"/ws/{foreign['room_id']}") as ws:
         ws.send_text(json.dumps(auth_msg(foreign["session_token"])))
-        with pytest.raises(Exception):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_text()
+        assert exc_info.value.code == WS_CLOSE_INVALID_TOKEN
 
 
 def test_cancel_with_bogus_token_rejected(client):

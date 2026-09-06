@@ -153,7 +153,7 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
                 break
             except RuntimeError as exc:
                 log.debug("ws recv on superseded/closed socket room=%s color=%s: %s",
-                          room.room_id, auth_color, exc)
+                          room.room_id, room.color_of(auth_uuid) or auth_color, exc)
                 break
             except Exception:
                 log.exception("ws recv failed room=%s color=%s",
