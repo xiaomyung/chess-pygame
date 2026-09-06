@@ -28,7 +28,8 @@ from tests.helpers import read_source_without_docstrings
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(chessshootout.__file__))
 SERVER_ROOT = os.path.join(PACKAGE_ROOT, "server")
 
-SERVER_LOG_MODULES = ("app", "broadcasts", "connections", "handlers", "sweep")
+SERVER_LOG_MODULES = ("app", "broadcasts", "connections", "handlers", "protocol",
+                      "sweep")
 LOUD_LEVELS = ("info", "warning")
 KV_TOKEN_RE = re.compile(r"(?:^|[\s(])([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
 

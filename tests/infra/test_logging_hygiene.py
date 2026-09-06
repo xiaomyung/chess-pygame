@@ -37,6 +37,8 @@ FRAME_FUNCTIONS = {
     "chessshootout/frontend/board/board.py": ["draw_board", "update_drag_physics"],
     "chessshootout/frontend/game/result_flow.py": ["update_result_pending"],
     "chessshootout/frontend/game/give_time.py": ["update_give_time_hold"],
+    "chessshootout/server/sweep.py": ["step_all"],
+    "chessshootout/server/app.py": ["_sweep_loop"],
 }
 
 

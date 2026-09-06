@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from tests.helpers import FakeClock, fake_uuid4
 
 ALICE = fake_uuid4(1)
 BOB = fake_uuid4(2)
+APP_KEY: pytest.StashKey[FastAPI] = pytest.StashKey()
 
 
 @pytest.fixture
@@ -25,15 +27,56 @@ def clock() -> FakeClock:
 
 
 @pytest.fixture
-def app(clock: FakeClock) -> FastAPI:
+def app(clock: FakeClock, request: pytest.FixtureRequest) -> FastAPI:
     """
     Build a server application wired to the test clock, with a small room cap so
-    the server-full path is reachable without creating a hundred rooms
+    the server-full path is reachable without creating a hundred rooms. The
+    application is left on the test item as well, so the housekeeping check can
+    still reach it after this fixture has been torn down
 
     :param clock: fake monotonic clock the app reads every timestamp from
+    :param request: the running test, whose item carries the application on
     :returns: the application under test
     """
-    return create_app(now_provider=clock, max_rooms=8)
+    application = create_app(now_provider=clock, max_rooms=8)
+    request.node.stash[APP_KEY] = application
+    return application
+
+
+@pytest.fixture
+def allow_sweep_failures() -> bool:
+    """
+    Opt one test out of the clean-housekeeping teardown check, for the handful
+    that break a step on purpose to prove a failure stays contained. Requesting
+    it is the whole opt-out; the flag itself is only read as present
+
+    :returns: True, so a test can also assert it asked for the opt-out
+    """
+    return True
+
+
+@pytest.fixture(autouse=True)
+def clean_sweep(request: pytest.FixtureRequest) -> Iterator[None]:
+    """
+    Fail any server test that left a swallowed housekeeping failure behind. The
+    sweep now contains a failing step instead of dying, which would otherwise
+    turn a broken step into a silently passing test in the ~30 tests that drive
+    those steps directly. Tests without an app never build one to be checked
+
+    :param request: the running test, read for the fixtures it asked for
+    :returns: a context that runs the check after the test body
+    """
+    yield
+    if "allow_sweep_failures" in request.fixturenames:
+        return
+    app = request.node.stash.get(APP_KEY, None)
+    if app is None:
+        return
+    sweep = app.state.sweep
+    if sweep.failure_count:
+        raise AssertionError(
+            f"housekeeping swallowed {sweep.failure_count} failure(s)"
+        ) from sweep._last_failure
 
 
 @pytest.fixture

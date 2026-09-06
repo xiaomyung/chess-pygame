@@ -6,39 +6,84 @@ from pydantic import BaseModel, Field, field_validator
 
 from chessshootout.backend.pieces import PIECE_VALUES, PieceType
 from chessshootout.backend.utils import BOARD_SIZE
+from chessshootout.server import logging_setup
 
 
-def _env_float(name: str, default: float) -> float:
+log = logging_setup.get_logger("chess.server.app")
+
+
+MIN_GRACE_SECONDS = 1.0
+MIN_HEARTBEAT_INTERVAL_SECONDS = 0.5
+MIN_HEARTBEAT_MISS_LIMIT = 1
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
     """
     Read one server tuning knob out of the process environment as a float, so an
-    operator can retune timings per deployment without a rebuild. A missing or
-    unparsable value falls back to the compiled-in default instead of failing
-    startup
+    operator can retune timings per deployment without a rebuild. A value that
+    is not a number, or one below the floor that keeps the setting workable, is
+    reported and replaced rather than allowed to break the running server
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.
-    :returns: the parsed value, or the default.
+    :param minimum: smallest value the setting is allowed to take.
+    :returns: the parsed value, the floor, or the default.
     """
     try:
-        return float(os.environ[name])
-    except (KeyError, ValueError):
+        raw = os.environ[name]
+    except KeyError:
         return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("env unparsable name=%s default=%s", name, default)
+        return default
+    if value < minimum:
+        log.warning("env clamped name=%s value=%s minimum=%s", name, value, minimum)
+        return minimum
+    return value
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, *, minimum: int) -> int:
     """
     Read one server tuning knob out of the process environment as an integer,
-    the counting counterpart of the float reader. A missing or unparsable value
-    falls back to the compiled-in default instead of failing startup
+    the counting counterpart of the float reader. It reports and replaces an
+    unreadable or too-small value the same way
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.
-    :returns: the parsed value, or the default.
+    :param minimum: smallest value the setting is allowed to take.
+    :returns: the parsed value, the floor, or the default.
     """
     try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
+        raw = os.environ[name]
+    except KeyError:
         return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("env unparsable name=%s default=%s", name, default)
+        return default
+    if value < minimum:
+        log.warning("env clamped name=%s value=%s minimum=%s", name, value, minimum)
+        return minimum
+    return value
+
+
+def _read_tuning() -> tuple[float, float, int]:
+    """
+    Read the three timing knobs an operator may override at once, so the whole
+    set is resolved in one place and can be exercised without reimporting the
+    module
+
+    :returns: disconnect grace, heartbeat interval and heartbeat miss limit.
+    """
+    return (
+        _env_float("GRACE_SECONDS", 60.0, minimum=MIN_GRACE_SECONDS),
+        _env_float("HEARTBEAT_INTERVAL_SECONDS", 2.0,
+                   minimum=MIN_HEARTBEAT_INTERVAL_SECONDS),
+        _env_int("HEARTBEAT_MISS_LIMIT", 3, minimum=MIN_HEARTBEAT_MISS_LIMIT),
+    )
 
 
 PROTOCOL_VERSION = 5
@@ -53,9 +98,7 @@ MIN_TIME_MINUTES = 1
 MAX_TIME_MINUTES = 180
 MIN_INCREMENT_SECONDS = 0
 MAX_INCREMENT_SECONDS = 180
-GRACE_SECONDS = _env_float("GRACE_SECONDS", 60.0)
-HEARTBEAT_INTERVAL_SECONDS = _env_float("HEARTBEAT_INTERVAL_SECONDS", 2.0)
-HEARTBEAT_MISS_LIMIT = _env_int("HEARTBEAT_MISS_LIMIT", 3)
+GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT = _read_tuning()
 HEARTBEAT_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL_SECONDS * HEARTBEAT_MISS_LIMIT
 MAX_SHARED_HIGHLIGHTS = 64
 MAX_SHARED_ARROWS = 128
@@ -168,6 +211,19 @@ class Reason:
     ABORTED = "aborted"
     ABANDONMENT = "abandonment"
     SERVER_SHUTDOWN = "server_shutdown"
+
+
+class HealthStatus:
+    """
+    The closed vocabulary the health endpoint answers with: serving normally,
+    serving but with no capacity left for a new game, or still answering while
+    the routine upkeep it runs on its own has fallen behind. Client and monitor
+    compare against these constants rather than against literals
+    """
+
+    OK = "ok"
+    FULL = "full"
+    DEGRADED = "degraded"
 
 
 class IdleWindowSpec(NamedTuple):
@@ -593,17 +649,20 @@ class ReclaimResponse(_Base):
 
 class HealthResponse(BaseModel):
     """
-    Liveness and load summary for the server: protocol and build version, how
-    many games are running, how many players are waiting to be paired, and how
-    long the process has been up
+    Liveness and load summary for the server: whether it is serving normally,
+    out of capacity or behind on its own upkeep, the protocol and build version
+    it runs, how many games are running, how many players are waiting to be
+    paired, how long the process has been up, and how many seconds it is since
+    the last complete housekeeping pass
     """
 
-    status: str = "ok"
+    status: str = HealthStatus.OK
     version: int = PROTOCOL_VERSION
     app_version: str = ""
     rooms_active: int
     queue_depth: int = 0
     uptime_s: float = 0.0
+    housekeeping_age_s: float = 0.0
 
 
 class AuthMessage(_Base):

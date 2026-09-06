@@ -5,7 +5,8 @@ from chessshootout.server.app import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.server.protocol import (
     AnnotationDeltaMessage, AnnotationSetWire, AnnotationsStateMessage, ArrowWire,
     AuthMessage, CHAT_PRESET_COUNT, ClockSnapshot, ErrorMessage,
-    FIRST_MOVE_ABORT_SECONDS, GameStartMessage, IDLE_RESIGN_SECONDS,
+    FIRST_MOVE_ABORT_SECONDS, GameStartMessage, HealthResponse, HealthStatus,
+    IDLE_RESIGN_SECONDS,
     IDLE_SECONDS_BY_OUTCOME, IDLE_WINDOW_BY_PLIES, IdleWindowMessage, IdleWindowWire,
     LockWire, MAX_INCREMENT_SECONDS, MAX_SHARED_ARROWS, MAX_SHARED_HIGHLIGHTS,
     MAX_TIME_MINUTES, MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES, MatchmakeRequest,
@@ -998,3 +999,42 @@ def test_full_annotations_state_serializes_under_inbound_cap():
     msg = AnnotationsStateMessage(sharing=True, highlights=highlights, arrows=arrows)
     payload = msg.model_dump_json(by_alias=True)
     assert len(payload.encode()) < MAX_INBOUND_MESSAGE_BYTES
+
+
+def _public_string_constants(cls):
+    """Every shared code a class publishes, read off the class rather than
+    listed by hand so a newly added one cannot escape the guards below."""
+    return {value for name, value in vars(cls).items()
+            if not name.startswith("_") and isinstance(value, str)}
+
+
+def test_health_status_is_a_closed_set_of_three_lowercase_codes():
+    """The health field is a plain string on the wire so an unknown future
+    status degrades gracefully in an old client, which makes the set of codes a
+    contract rather than a type. Three, spelled the same way every other code in
+    the protocol is."""
+    statuses = _public_string_constants(HealthStatus)
+    assert statuses == {"ok", "full", "degraded"}
+    for value in statuses:
+        assert value == value.lower() and value.isascii() and value.isidentifier()
+
+
+def test_no_health_status_collides_with_a_reason_code():
+    """Both vocabularies travel as bare strings and the client dispatches on
+    them, so a code that meant `game ended` in one and `server state` in the
+    other would be read by whichever branch tested first."""
+    overlap = _public_string_constants(HealthStatus) & _public_string_constants(Reason)
+    assert overlap == set(), f"health status and reason codes share {sorted(overlap)}"
+
+
+def test_health_response_defaults_describe_a_healthy_just_started_server():
+    """rooms_active is the only field a caller has to supply; everything else
+    has to default to the honest reading for a server that has just come up, so
+    a missing field can never publish a scarier state than the real one."""
+    body = HealthResponse(rooms_active=0)
+    assert body.status == HealthStatus.OK
+    assert body.housekeeping_age_s == 0.0
+    assert body.version == PROTOCOL_VERSION
+    assert body.queue_depth == 0
+    assert body.uptime_s == 0.0
+    assert "max_rooms" not in body.model_dump(), "the room cap is not published"

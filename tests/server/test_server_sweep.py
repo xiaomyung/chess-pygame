@@ -6,16 +6,23 @@ expiry, pre-game orphan drop, abandoned/timed-out queue reaping,
 post-game rematch window, finished-room GC) so we drive each
 independently without the full asyncio loop.
 """
+import asyncio
+import logging
+from types import SimpleNamespace
+
 import pytest
 
 from chessshootout.backend.utils import Square
+from chessshootout.server.app import create_app
 from chessshootout.server.protocol import (
     GRACE_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, QUEUE_MAX_WAIT_SECONDS, Reason)
 from chessshootout.server.rooms import POST_GAME_DISCONNECT_GRACE, QUEUE_ABANDON_SECONDS
-from chessshootout.server.sweep import PREGAME_CONNECT_GRACE_SECONDS, WS_CLOSE_QUEUE_TIMEOUT
+from chessshootout.server.sweep import (
+    PREGAME_CONNECT_GRACE_SECONDS, SWEEP_ERROR_LOG_INTERVAL_SECONDS,
+    SWEEP_STALE_SECONDS, WS_CLOSE_QUEUE_TIMEOUT)
 from tests.server.test_server_broadcasts import RecordingWS
-from tests.helpers import fake_uuid4
-from tests.server.conftest import ALICE, BOB
+from tests.helpers import FakeClock, fake_uuid4
+from tests.server.conftest import ALICE, APP_KEY, BOB, clean_sweep
 
 
 async def _pair(rooms, time_minutes=5):
@@ -532,3 +539,213 @@ async def test_heartbeat_timeout_skips_pre_first_move_and_finished(sweep, app, c
     rooms.finalize_result(room.room_id, Reason.RESIGNATION, winner_color="white")
     await sweep.step_heartbeat_timeout()
     assert room.white.connected is True
+
+
+async def _pair_nth(rooms, n, time_minutes=5):
+    """One more paired room, with uuids nobody else in the test is using, so a
+    single test can hold several live games at once."""
+    for offset, side in ((0, "white"), (1, "black")):
+        await rooms.enqueue(client_uuid=fake_uuid4(300 + 2 * n + offset),
+                            nickname=f"P{n}{side[0]}", session_token=f"t{n}{offset}",
+                            time_minutes=time_minutes, increment_seconds=0,
+                            side_preference=side)
+    return list(rooms._active.values())[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_step_never_stops_the_steps_that_come_after_it(
+        sweep, monkeypatch, allow_sweep_failures):
+    """Per-step isolation. The old loop died on the first exception any step
+    raised and /healthz stayed 200 -- clocks, grace and queue reaping silently
+    stopped for the life of the process. The first step is broken here on
+    purpose; every later step in the same pass still has to run."""
+    calls = []
+
+    async def _boom():
+        raise RuntimeError("skillcheck step exploded")
+
+    def _tracer(name):
+        def _sync():
+            calls.append(name)
+        return _sync
+
+    async def _atracer(name):
+        calls.append(name)
+
+    monkeypatch.setattr(sweep, "step_skillcheck_deadline", _boom)
+    monkeypatch.setattr(sweep, "step_clock_and_idle_windows",
+                        lambda: _atracer("clock_and_idle"))
+    monkeypatch.setattr(sweep, "step_heartbeat_timeout", lambda: _atracer("heartbeat"))
+    monkeypatch.setattr(sweep, "step_grace_expired", lambda: _atracer("grace"))
+    monkeypatch.setattr(sweep, "step_drop_orphans_pre_game", _tracer("drop_orphans"))
+    monkeypatch.setattr(sweep, "step_reap_abandoned_queue", _tracer("reap_queue"))
+    monkeypatch.setattr(sweep, "step_reap_timed_out_queue",
+                        lambda: _atracer("timeout_queue"))
+    monkeypatch.setattr(sweep, "step_post_game", lambda: _atracer("post_game"))
+    monkeypatch.setattr(sweep.rooms, "gc_finished_rooms", _tracer("gc"))
+
+    await sweep.step_all()
+
+    assert calls == ["clock_and_idle", "heartbeat", "grace", "drop_orphans",
+                     "reap_queue", "timeout_queue", "post_game", "gc"]
+    assert sweep.failure_count == 1
+    assert isinstance(sweep._last_failure, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_a_poisoned_room_leaves_its_siblings_ticking(
+        sweep, app, clock, monkeypatch, allow_sweep_failures):
+    """Per-ROOM isolation inside one step, the finer half of the ladder. One
+    room whose backend raises mid-walk used to take every room behind it in the
+    same iteration order down with it -- so a single corrupt game froze other
+    people's clocks. The sibling still has to flag."""
+    rooms = app.state.rooms
+    poisoned = await _pair_nth(rooms, 0, time_minutes=1)
+    healthy = await _pair_nth(rooms, 1, time_minutes=1)
+    for room in (poisoned, healthy):
+        room.started_at = clock()
+        room.first_move_at = clock()
+        room.plies_ever = 2
+
+    def _boom():
+        raise RuntimeError("poisoned backend")
+
+    monkeypatch.setattr(poisoned.backend, "tick_clock", _boom)
+    clock.advance(70)
+
+    await sweep.step_clock_and_idle_windows()
+
+    assert poisoned.result is None
+    assert healthy.result is not None and healthy.result[0] == Reason.TIMEOUT
+    assert sweep.failure_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_type", [asyncio.CancelledError, KeyboardInterrupt],
+                         ids=["cancelled", "keyboard_interrupt"])
+async def test_a_cancel_or_an_interrupt_is_never_swallowed_by_the_step_guard(
+        sweep, exc_type):
+    """The net catches Exception, never BaseException: a shutdown cancel has to
+    reach the loop that owns it and Ctrl-C has to reach the process. Swallowing
+    either would leave a server that cannot be stopped."""
+    async def _raise():
+        raise exc_type()
+
+    with pytest.raises(exc_type):
+        await sweep._guard("post_game", _raise)
+    assert sweep.failure_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_clean_pass_restamps_the_freshness_and_a_dirty_one_does_not(
+        sweep, clock, monkeypatch, allow_sweep_failures):
+    """The stamp is the whole basis of the degraded verdict, so it may only move
+    when EVERY step of a pass got through. A pass that half-worked reports as if
+    it had not run at all."""
+    sweep.mark_running()
+    clock.advance(10)
+    await sweep.step_all()
+    assert sweep.age_s == 0.0
+
+    async def _boom():
+        raise RuntimeError("post-game step exploded")
+
+    monkeypatch.setattr(sweep, "step_post_game", _boom)
+    clock.advance(10)
+    await sweep.step_all()
+    assert sweep.age_s == pytest.approx(10.0), "a dirty pass leaves the stamp alone"
+    clock.advance(10)
+    assert sweep.age_s == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_the_freshness_age_reads_zero_until_the_timer_starts(sweep, clock):
+    """Before the loop runs there is nothing to be late for. Without this a
+    server would answer degraded for its first half minute of life, and every
+    in-process test app -- which never starts the loop -- would too."""
+    clock.advance(600)
+    assert sweep.age_s == 0.0
+    assert sweep.is_stale is False
+
+    sweep.mark_running()
+    clock.advance(SWEEP_STALE_SECONDS)
+    assert sweep.age_s == pytest.approx(SWEEP_STALE_SECONDS)
+    assert sweep.is_stale is False, "exactly at the limit is still healthy"
+    clock.advance(0.1)
+    assert sweep.is_stale is True
+
+
+@pytest.mark.asyncio
+async def test_repeated_failures_are_reported_once_per_interval_with_a_count(
+        sweep, clock, caplog, allow_sweep_failures):
+    """A fault that repeats every tick would write ten ERROR lines a second and
+    bury everything else in the journal. The first one is immediate, the rest
+    are counted into the next line the throttle lets through."""
+    with caplog.at_level(logging.ERROR, logger="chess.server.app"):
+        for _ in range(5):
+            sweep._note_failure("post_game", RuntimeError("nope"))
+        records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(records) == 1, "four repeats inside the interval stay quiet"
+        assert "step=post_game" in records[0].getMessage()
+        assert "suppressed=0" in records[0].getMessage()
+        assert records[0].exc_info is not None, "the first report carries a traceback"
+
+        clock.advance(SWEEP_ERROR_LOG_INTERVAL_SECONDS)
+        sweep._note_failure("grace_expired", RuntimeError("still nope"))
+
+    records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(records) == 2
+    assert "step=grace_expired" in records[1].getMessage()
+    assert "suppressed=4" in records[1].getMessage()
+    assert sweep.failure_count == 6
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_fails_outright_stops_the_freshness_stamp(
+        sweep, clock, allow_sweep_failures):
+    """note_unhandled is the loop's own arm of the ladder: a failure that
+    escaped every step guard still has to degrade the health report rather than
+    kill the loop."""
+    sweep.mark_running()
+    clock.advance(SWEEP_STALE_SECONDS)
+    await sweep.step_all()
+    assert sweep.age_s == 0.0
+
+    clock.advance(SWEEP_STALE_SECONDS + 0.1)
+    sweep.note_unhandled(RuntimeError("the whole pass exploded"))
+
+    assert sweep.failure_count == 1
+    assert isinstance(sweep._last_failure, RuntimeError)
+    assert sweep.is_stale is True
+
+
+@pytest.mark.parametrize(
+    "fixturenames, stashed, expect_raise",
+    [
+        pytest.param((), True, True, id="swallowed_failure_fails_the_test"),
+        pytest.param(("allow_sweep_failures",), True, False, id="opt_out_is_honoured"),
+        pytest.param((), False, False, id="a_test_without_an_app_is_skipped"),
+    ],
+)
+def test_the_clean_sweep_teardown_check_catches_a_swallowed_failure(
+        fixturenames, stashed, expect_raise):
+    """The suite's own safety net, driven by hand. ~30 tests call sweep steps
+    directly and assert on room state; now that a step failure is contained
+    rather than raised, a broken step would leave those tests passing on a room
+    nothing ever touched. This is the check that stops that -- built on its own
+    app so the autouse copy watching this test has nothing to find."""
+    app = create_app(now_provider=FakeClock(), max_rooms=8)
+    app.state.sweep._note_failure("post_game", RuntimeError("swallowed"))
+    node = SimpleNamespace(stash={APP_KEY: app} if stashed else {})
+    request = SimpleNamespace(fixturenames=fixturenames, node=node)
+
+    gen = clean_sweep._get_wrapped_function()(request)
+    next(gen)
+    if not expect_raise:
+        with pytest.raises(StopIteration):
+            gen.send(None)
+        return
+    with pytest.raises(AssertionError) as excinfo:
+        gen.send(None)
+    assert "swallowed 1 failure" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)

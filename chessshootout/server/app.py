@@ -26,13 +26,17 @@ from chessshootout.server.broadcasts import (
     broadcast_game_start, finalize_and_broadcast, idle_window_wire,
     resolve_skillcheck_fail)
 from chessshootout.server.connections import ConnectionRegistry, send
-from chessshootout.server.handlers import arrow_wires, clock_snapshot, dispatch
+from chessshootout.server.handlers import (
+    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
+    arrow_wires, clock_snapshot, dispatch,
+)
 from chessshootout.server.moderation import library
 from chessshootout.server.protocol import (
     ANNOTATIONS_PER_SECOND, AnnotationSetWire,
     AuthMessage, CHAT_COOLDOWN_SECONDS, CancelMatchmakeRequest,
-    ConnectionStatusMessage, ErrorMessage,
-    HealthResponse, HistoryEntryWire, LockWire,
+    ConnectionStatusMessage, ErrorMessage, GRACE_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS,
+    HealthResponse, HealthStatus, HistoryEntryWire, LockWire,
     MatchmakeRequest, MatchmakeResponse,
     PROTOCOL_VERSION, PendingSkillCheckWire, Reason, ReasonEnvelope, ReclaimRequest,
     ReclaimResponse, RematchRequestMessage, RematchUpdateMessage,
@@ -43,7 +47,7 @@ from chessshootout.server.rooms import (
     PAIRING_WAIT_SECONDS, PlayerSlot, Room, RoomManager, ServerFullError,
     SharedAnnotations,
 )
-from chessshootout.server.sweep import Sweep
+from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
 
 
 CLOCK_TICK_INTERVAL_SECONDS = 0.1
@@ -333,6 +337,12 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         log.info("gameserver v%d release=%s listening (max_rooms=%d)",
                  PROTOCOL_VERSION, app_version() or "dev", max_rooms)
         log_trusted_proxies()
+        log.info("tuning grace=%.1f heartbeat=%.1f miss_limit=%d heartbeat_timeout=%.1f "
+                 "tick=%.2f sweep_stale=%.1f transit_grace=%.2f stable_heartbeats=%d",
+                 GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT,
+                 HEARTBEAT_TIMEOUT_SECONDS, CLOCK_TICK_INTERVAL_SECONDS,
+                 SWEEP_STALE_SECONDS, RESYNC_TRANSIT_GRACE_SECONDS,
+                 RESYNC_STABLE_MISMATCH_HEARTBEATS)
         sweep_task = asyncio.create_task(_sweep_loop(app))
         try:
             yield
@@ -436,17 +446,27 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
     async def healthz() -> HealthResponse:
         """
         Liveness and load check for the server, used both by monitoring and by
-        the game's server picker. Reports the protocol and build version, how
-        many games are being played, how many players are waiting for an
-        opponent and how long the server has been up
+        the game's server picker. Reports whether the server is serving
+        normally, has no room left for another game or has fallen behind on the
+        upkeep it runs on its own, along with the protocol and build version,
+        how many games are being played, how many players are waiting for an
+        opponent, how long the server has been up and how many seconds it is
+        since the last complete upkeep pass
 
         :returns: the current health and load summary
         """
+        status = HealthStatus.OK
+        if rooms.rooms_active + rooms.queue_depth >= max_rooms:
+            status = HealthStatus.FULL
+        elif app.state.sweep.is_stale:
+            status = HealthStatus.DEGRADED
         return HealthResponse(
+            status=status,
             app_version=app_version(),
             rooms_active=rooms.rooms_active,
             queue_depth=rooms.queue_depth,
             uptime_s=now_provider() - app.state.started_at,
+            housekeeping_age_s=app.state.sweep.age_s,
         )
 
     @app.post("/matchmake", response_model=MatchmakeResponse,
@@ -686,15 +706,21 @@ async def _sweep_loop(app: FastAPI) -> None:
     The server's heartbeat. Every tick it runs the whole sweep -- clocks,
     skill-check deadlines, idle windows, disconnect grace, queue reaping and
     cleanup of finished rooms -- which is what makes a game end on time even
-    when nobody sends anything. It starts with the app and only ever stops by
+    when nobody sends anything. A pass that fails outright is recorded and the
+    next tick still runs, so the loop starts with the app and only ever stops by
     being cancelled at shutdown
 
     :param app: application whose sweep and shared state the loop drives
     """
+    sweep: Sweep = app.state.sweep
+    sweep.mark_running()
     try:
         while True:
             await asyncio.sleep(CLOCK_TICK_INTERVAL_SECONDS)
-            await app.state.sweep.step_all()
+            try:
+                await sweep.step_all()
+            except Exception as exc:
+                sweep.note_unhandled(exc)
     except asyncio.CancelledError:
         pass
 

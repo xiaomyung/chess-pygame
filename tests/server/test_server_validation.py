@@ -20,8 +20,10 @@ from chessshootout.server.app import (
     log_trusted_proxies,
 )
 from chessshootout.server.protocol import (
-    CancelMatchmakeRequest, MatchmakeRequest, Reason, ReclaimRequest,
-    ResumeRequest, is_uuid4,
+    CancelMatchmakeRequest, HealthStatus, MIN_GRACE_SECONDS,
+    MIN_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_MISS_LIMIT, MatchmakeRequest,
+    Reason, ReclaimRequest, ResumeRequest, _env_float, _env_int, _read_tuning,
+    is_uuid4,
 )
 from tests.helpers import FakeClock, fake_uuid4
 
@@ -247,15 +249,17 @@ def test_uuid_rate_limiter_prunes_stale_buckets(clock):
     assert len(limiter._calls) == 0
 
 
-def test_healthz_includes_version_field(client):
+def test_healthz_includes_version_and_status_fields(client):
     body = client.get("/healthz").json()
     assert body["version"] == PROTOCOL_VERSION
+    assert body["status"] == HealthStatus.OK
 
 
 def test_healthz_includes_queue_depth_and_uptime(clock, client):
     body = client.get("/healthz").json()
     assert body["queue_depth"] == 0
     assert body["uptime_s"] == pytest.approx(0.0, abs=1e-6)
+    assert body["housekeeping_age_s"] == pytest.approx(0.0, abs=1e-6)
     clock.advance(7.5)
     body = client.get("/healthz").json()
     assert body["uptime_s"] == pytest.approx(7.5, abs=1e-3)
@@ -351,3 +355,92 @@ def test_healthz_queue_depth_reflects_pending_room(client):
     body = client.get("/healthz").json()
     assert body["queue_depth"] == 0
     assert body["rooms_active"] == 1
+
+
+TUNING_PROBE = "CHESS_TUNING_PROBE"
+
+
+@pytest.mark.parametrize(
+    "reader, default, minimum",
+    [
+        pytest.param(_env_float, 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+    ],
+)
+def test_a_missing_tuning_variable_is_the_silent_compiled_in_default(
+        monkeypatch, caplog, reader, default, minimum):
+    """Not setting a knob is the normal case -- every deployment leaves most of
+    them alone -- so it must not cost a log line."""
+    monkeypatch.delenv(TUNING_PROBE, raising=False)
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == default
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "reader, default, minimum",
+    [
+        pytest.param(_env_float, 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+    ],
+)
+def test_an_unparsable_tuning_value_falls_back_and_says_so(
+        monkeypatch, caplog, reader, default, minimum):
+    """These used to fall back in total silence, so `GRACE_SECONDS=60s` ran a
+    server on the default forever with nothing to show for it. The variable is
+    named; the value never is -- an operator-supplied string in a log line is a
+    forged-record vector."""
+    monkeypatch.setenv(TUNING_PROBE, "sixty seconds\nmatchmake ok room=forged")
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == default
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert f"name={TUNING_PROBE}" in messages[0]
+    assert f"default={default}" in messages[0]
+    assert "sixty seconds" not in messages[0]
+    assert "forged" not in messages[0]
+
+
+@pytest.mark.parametrize(
+    "reader, raw, default, minimum",
+    [
+        pytest.param(_env_float, "0", 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, "0", 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+    ],
+)
+def test_a_tuning_value_below_its_floor_is_clamped_and_says_so(
+        monkeypatch, caplog, reader, raw, default, minimum):
+    """SECURITY-adjacent misconfiguration: a zero heartbeat interval produced a
+    zero heartbeat timeout, which disconnects every player the moment they
+    connect. A number that would break the server is replaced by the floor
+    rather than obeyed."""
+    monkeypatch.setenv(TUNING_PROBE, raw)
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == minimum
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert messages[0].startswith("env clamped")
+    assert f"name={TUNING_PROBE}" in messages[0]
+    assert f"minimum={minimum}" in messages[0]
+
+
+def test_read_tuning_clamps_every_knob_at_its_own_floor(monkeypatch, caplog):
+    """The three real variable names together, so the floors are pinned where an
+    operator actually sets them. Reading them through one function is what makes
+    this testable without reimporting the module."""
+    for name in ("GRACE_SECONDS", "HEARTBEAT_INTERVAL_SECONDS", "HEARTBEAT_MISS_LIMIT"):
+        monkeypatch.setenv(name, "0")
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        grace, interval, miss_limit = _read_tuning()
+    assert (grace, interval, miss_limit) == (
+        MIN_GRACE_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_MISS_LIMIT)
+    assert interval * miss_limit > 0, "a zero heartbeat timeout is unreachable"
+    assert len(caplog.records) == 3, "one warning per clamped knob"
+
+
+def test_read_tuning_takes_an_operators_values_when_they_are_workable(monkeypatch):
+    """The point of the knobs: sane overrides still get through untouched."""
+    monkeypatch.setenv("GRACE_SECONDS", "45")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "1.5")
+    monkeypatch.setenv("HEARTBEAT_MISS_LIMIT", "5")
+    assert _read_tuning() == (45.0, 1.5, 5)

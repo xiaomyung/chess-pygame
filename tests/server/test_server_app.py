@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import random
@@ -10,10 +11,11 @@ from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 from slowapi import Limiter
 
+from chessshootout.server import app as app_module
 from chessshootout.server.app import (
     MATCHMAKE_PER_IP_LIMIT, MAX_INBOUND_MESSAGE_BYTES, PROTOCOL_VERSION,
     UuidRateLimiter, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
-    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED, create_app,
+    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED, _sweep_loop, create_app,
 )
 from chessshootout.server.broadcasts import broadcast_game_start, idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
@@ -24,12 +26,13 @@ from chessshootout.server.handlers import (
     _ResyncGate, handle_ping,
 )
 from chessshootout.server.protocol import (
-    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, IDLE_RESIGN_SECONDS,
-    MAX_INCREMENT_SECONDS, MAX_TIME_MINUTES, MIN_INCREMENT_SECONDS,
-    MIN_TIME_MINUTES, Reason,
+    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS, HealthStatus,
+    IDLE_RESIGN_SECONDS, MAX_INCREMENT_SECONDS, MAX_TIME_MINUTES,
+    MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES, Reason,
 )
 from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
-from chessshootout.server.sweep import Sweep
+from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
 from tests.helpers import FakeClock, fake_uuid4
 from tests.server.conftest import ALICE, BOB, auth_msg
 from tests.server.test_server_broadcasts import RecordingWS
@@ -1247,3 +1250,136 @@ async def test_reclaim_with_no_live_socket_is_a_clean_noop(app, client):
     r = client.post("/reclaim", json={"version": PROTOCOL_VERSION, "client_uuid": ALICE})
 
     assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_the_housekeeping_loop_keeps_ticking_after_a_pass_raises(
+        app, monkeypatch, allow_sweep_failures):
+    """The loop used to die on the first exception that escaped a pass, and
+    /healthz went on answering 200: clocks, grace and queue reaping stopped for
+    the life of the process with nothing to show for it. Now the failure is
+    recorded and the next tick still runs."""
+    sweep = app.state.sweep
+    passes = []
+
+    async def _boom():
+        passes.append("tick")
+        raise RuntimeError("whole pass exploded")
+
+    monkeypatch.setattr(sweep, "step_all", _boom)
+    monkeypatch.setattr(app_module, "CLOCK_TICK_INTERVAL_SECONDS", 0)
+
+    task = asyncio.create_task(_sweep_loop(app))
+    for _ in range(500):
+        if len(passes) >= 3:
+            break
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.wait([task], timeout=1)
+
+    assert len(passes) >= 3, "one failed pass must not end the loop"
+    assert sweep.failure_count >= 3
+    assert isinstance(sweep._last_failure, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_the_housekeeping_loop_cancels_cleanly_at_shutdown(app, monkeypatch):
+    """Shutdown cancels the task; the loop has to absorb that one cancellation
+    and return, rather than let it surface as an error at the end of a normal
+    stop."""
+    monkeypatch.setattr(app_module, "CLOCK_TICK_INTERVAL_SECONDS", 0)
+    task = asyncio.create_task(_sweep_loop(app))
+    for _ in range(100):
+        if app.state.sweep._running:
+            break
+        await asyncio.sleep(0)
+    assert app.state.sweep._running, "the loop marks itself running as it starts"
+
+    task.cancel()
+    await asyncio.wait([task], timeout=1)
+
+    assert task.done()
+    assert not task.cancelled(), "the loop swallows its own cancellation"
+    assert task.exception() is None
+
+
+def test_healthz_reports_ok_with_a_housekeeping_age(client):
+    """The two fields an operator and the in-game server picker read. An app
+    whose loop never started reports age zero -- there is nothing to be late
+    for before the first tick."""
+    body = client.get("/healthz").json()
+    assert body["status"] == HealthStatus.OK
+    assert body["housekeeping_age_s"] == 0.0
+
+
+def test_healthz_reports_full_once_the_room_cap_is_reached(app, client):
+    """`full` is computed off exactly the predicate that refuses matchmaking, so
+    a player told the server is full can confirm it, and a monitor sees the same
+    thing. Filled with a distinct uuid and time control per request so nothing
+    pairs and every slot counts."""
+    max_rooms = app.state.rooms._max_rooms
+    for i in range(max_rooms - 1):
+        assert _matchmake(client, uuid=fake_uuid4(200 + i), nickname=f"N{i}",
+                          time=i + 1).status_code == 200
+    assert client.get("/healthz").json()["status"] == HealthStatus.OK
+
+    assert _matchmake(client, uuid=ZED, nickname="Z", time=100).status_code == 200
+    r = client.get("/healthz")
+    assert r.status_code == 200, "a full server still answers 200"
+    assert r.json()["status"] == HealthStatus.FULL
+    assert _matchmake(client, uuid=CARL, nickname="C", time=120).status_code == 503
+
+
+@pytest.mark.parametrize(
+    "age, expected",
+    [
+        pytest.param(SWEEP_STALE_SECONDS, HealthStatus.OK, id="exactly_at_the_limit"),
+        pytest.param(SWEEP_STALE_SECONDS + 0.001, HealthStatus.DEGRADED,
+                     id="a_hair_past_the_limit"),
+    ],
+)
+def test_healthz_turns_degraded_only_past_the_staleness_limit(
+        app, client, clock, age, expected):
+    """The boundary itself, both sides of it. The limit is loose so one slow
+    socket send inside a walk cannot flip a server's health, which only works if
+    `at the limit` still counts as healthy."""
+    app.state.sweep.mark_running()
+    clock.advance(age)
+    r = client.get("/healthz")
+    assert r.status_code == 200, "a degraded server still answers 200"
+    body = r.json()
+    assert body["status"] == expected
+    assert body["housekeeping_age_s"] == pytest.approx(age)
+
+
+def test_a_full_server_reads_full_even_while_it_is_also_behind(app, client, clock):
+    """Only one status fits in the field, so the order is fixed: no capacity is
+    the thing a waiting player is actually hitting, and it wins."""
+    app.state.sweep.mark_running()
+    clock.advance(SWEEP_STALE_SECONDS + 10)
+    for i in range(app.state.rooms._max_rooms):
+        assert _matchmake(client, uuid=fake_uuid4(200 + i), nickname=f"N{i}",
+                          time=i + 1).status_code == 200
+    assert app.state.sweep.is_stale is True
+    assert client.get("/healthz").json()["status"] == HealthStatus.FULL
+
+
+def test_startup_logs_the_tuning_values_once(app, caplog):
+    """Every knob an operator can move, printed where they can read back what
+    the process actually resolved -- an env typo or a clamp is otherwise
+    invisible until a timeout misbehaves in production."""
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        with TestClient(app):
+            pass
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("tuning ")]
+    assert len(lines) == 1, f"one tuning line per startup, got {lines}"
+    line = lines[0]
+    assert f"grace={GRACE_SECONDS:.1f}" in line
+    assert f"heartbeat={HEARTBEAT_INTERVAL_SECONDS:.1f}" in line
+    assert f"miss_limit={HEARTBEAT_MISS_LIMIT:d}" in line
+    assert f"heartbeat_timeout={HEARTBEAT_TIMEOUT_SECONDS:.1f}" in line
+    assert f"tick={app_module.CLOCK_TICK_INTERVAL_SECONDS:.2f}" in line
+    assert f"sweep_stale={SWEEP_STALE_SECONDS:.1f}" in line
+    assert f"transit_grace={RESYNC_TRANSIT_GRACE_SECONDS:.2f}" in line
+    assert f"stable_heartbeats={RESYNC_STABLE_MISMATCH_HEARTBEATS:d}" in line
