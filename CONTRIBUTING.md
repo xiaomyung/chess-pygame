@@ -81,10 +81,14 @@ def my_fun(x: int, z: int | str, w: str | None = None) -> int:
 
 ## Logging
 
-Every module gets its own `log = logging.getLogger(__name__)` (or the
-matching `chess.*` / `logging_setup.get_logger("chess.server.app")` name used
-elsewhere in that package — grep a sibling file before adding a new logger
-name). Pick the level by what the line is *for*, not by habit:
+Most modules get their own `log = logging.getLogger(__name__)` (or the matching
+`chess.*` name already used elsewhere in that package — grep a sibling file
+before adding a new logger name). The server is the deliberate exception: every
+module under `chessshootout/server/` logs through
+`logging_setup.get_logger("chess.server.app")`, one name for the whole package.
+Nothing there wants per-module level control, and the server tests filter
+`caplog` by that single name — a per-module logger would make its lines
+invisible to them. Pick the level by what the line is *for*, not by habit:
 
 - **INFO** — a user action or a state transition: a game starts or ends, a
   move gets undone, an offer is sent/received/resolved, a setting is

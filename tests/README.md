@@ -43,10 +43,15 @@ Tests mirror the source layout, five dirs under `tests/`:
   dispatch. Flat — no `tests/frontend/board/` subdirs.
 - `tests/server/` — the `chessshootout/server/` package (FastAPI app,
   handlers, rooms, sweep, protocol — the wire models' own field bounds live in
-  `test_server_protocol.py` — and `moderation/`: the symbol detector plus its
-  library and timing pin in `test_moderation_flow.py` /
+  `test_server_protocol.py`, the heartbeat transit window and the two-strike
+  resync model in `test_server_ping_tolerance.py` — and `moderation/`: the
+  symbol detector plus its library and timing pin in `test_moderation_flow.py` /
   `test_moderation_guards.py`, including the per-room and per-player CPU meter
-  that force-stops sharing once a client outspends its budget).
+  that force-stops sharing once a client outspends its budget). The modules
+  split out of `app.py` (`limits.py`, `routes_http.py`, `ws_session.py`) kept
+  their coverage where it already was — `test_server_app.py`,
+  `test_server_validation.py`, `test_rate_limit_client_ip.py` — with the imports
+  and monkeypatch targets moved to the new homes.
 - `tests/online/` — client-side online multiplayer: the top-level
   `chessshootout/online/` package (`OnlineClient`, `ServerTransport`) plus
   `chessshootout/frontend/online_coordinator.py` and the offer banners.
