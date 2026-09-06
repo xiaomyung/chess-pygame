@@ -86,7 +86,9 @@ def _read_tuning() -> tuple[float, float, int]:
     )
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
+MIN_CLIENT_VERSION = "2.13.0"
+CLIENT_VERSION_MAX_LEN = 32
 MAX_NICKNAME_LEN = 20
 GIVE_TIME_SECONDS = 15
 GIVE_TIME_TICK_MS = 100
@@ -113,6 +115,7 @@ UUID4_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
 )
 COORD_RE = re.compile(r"^[a-h][1-8]$")
+_CLIENT_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\Z")
 
 
 def is_uuid4(value: object) -> bool:
@@ -159,6 +162,50 @@ def _validate_coord(value: str, name: str) -> str:
     return value
 
 
+def parse_client_version(raw: object) -> tuple[int, int, int] | None:
+    """
+    Read a build version out of untrusted text as three numbers that can be
+    compared. Only plain major.minor.patch in ASCII digits is accepted, and only
+    up to a sane length, so no amount of decoration, padding or look-alike digits
+    can make an old build compare as a new one
+
+    :param raw: candidate version; anything that is not a string fails.
+    :returns: the three version numbers, or None when the text is not a version.
+    """
+    if not isinstance(raw, str) or len(raw) > CLIENT_VERSION_MAX_LEN:
+        return None
+    if not _CLIENT_VERSION_RE.match(raw):
+        return None
+    try:
+        major, minor, patch = (int(part) for part in raw.split("."))
+    except ValueError:
+        return None
+    return (major, minor, patch)
+
+
+def client_version_outdated(client_version: str, minimum: str) -> bool:
+    """
+    Decide whether a build is too old to be let into a game. A build that states
+    no version at all is let through -- that is what a run from source reports,
+    and the protocol number is what turns an incompatible build away -- while one
+    that states a version nobody can read is not trusted. A minimum that cannot
+    itself be read turns nobody away, so a mistyped floor never locks the server
+
+    :param client_version: version the client stated, empty when it has none.
+    :param minimum: oldest version still accepted.
+    :returns: True when the client is older than the minimum.
+    """
+    if client_version == "":
+        return False
+    floor = parse_client_version(minimum)
+    if floor is None:
+        return False
+    mine = parse_client_version(client_version)
+    if mine is None:
+        return True
+    return mine < floor
+
+
 def _validate_coords(values: list[str]) -> list[str]:
     """
     Gate a whole set of highlighted squares in one go, the list counterpart of
@@ -181,6 +228,7 @@ class Reason:
     """
 
     VERSION_MISMATCH = "version_mismatch"
+    CLIENT_OUTDATED = "client_outdated"
     INVALID_MESSAGE = "invalid_message"
     INVALID_FIELD = "invalid_field"
     INVALID_MOVE_FORMAT = "invalid_move_format"
@@ -474,11 +522,14 @@ class MatchmakeRequest(_Base):
     """
     A player's request to be paired for an online game. Says who they are, which
     time control they want to play and which side they would prefer; they are
-    paired with an opponent asking for the same time control
+    paired with an opponent asking for the same time control. It also states
+    which build of the game they run, so a build too old for this server is
+    turned away before anyone waits for an opponent
     """
 
     nickname: str
     client_uuid: str
+    client_version: str = Field(default="", max_length=CLIENT_VERSION_MAX_LEN)
     time_minutes: int = Field(ge=MIN_TIME_MINUTES, le=MAX_TIME_MINUTES)
     increment_seconds: int = Field(ge=MIN_INCREMENT_SECONDS, le=MAX_INCREMENT_SECONDS)
     side_preference: Literal["white", "black", "random"] = "random"

@@ -25,9 +25,12 @@ from chessshootout.frontend.online_coordinator import (
 )
 from chessshootout.frontend.screens.game import IDLE_RESIGN_NOTICE_SECONDS, IdleWindow
 from chessshootout.online.client import Event, OnlineClient
-from chessshootout.server.protocol import Reason
+from chessshootout.server.protocol import (
+    MIN_CLIENT_VERSION, MatchmakeRequest, Reason, client_version_outdated,
+)
 from tests.helpers import (
-    make_app, online_start_payload as _online_start_payload, start_single_screen,
+    fake_uuid4, make_app, online_start_payload as _online_start_payload,
+    start_single_screen,
 )
 
 
@@ -1108,3 +1111,80 @@ def test_opponent_left_while_viewing_the_result_does_not_yank_to_menu():
     assert app.coordinator.client is None, "session is still torn down"
     assert app.game.current_result() is not None, "result stays adopted"
     assert app.toast.is_visible()
+
+
+def test_the_matchmake_request_states_which_build_this_client_is(monkeypatch):
+    """The request dict is the SINGLE place `client_version` is stamped -- the
+    transport only forwards the finished model. Read straight off
+    paths.get_app_version(), which is empty in a source checkout and the release
+    version in a packaged build, so what the gate judges is what the footer
+    shows."""
+    app = make_app(1000, 800)
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: "2.13.0")
+    monkeypatch.setattr(coordinator_module.env, "get_or_create_client_uuid",
+                        lambda: fake_uuid4(7))
+    monkeypatch.setattr(coordinator_module.env, "get_country", lambda: None)
+    monkeypatch.setattr(coordinator_module.env, "get_hide_opp_marks", lambda: False)
+    sent = []
+
+    class _RecordingClient:
+        """Stands in for the real OnlineClient so the request is captured
+        without a socket; only the two calls this path makes are needed."""
+
+        def __init__(self):
+            self.room_id = None
+            self.state = "disconnected"
+
+        def connect(self, addr, request):
+            sent.append((addr, request))
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(coordinator_module, "OnlineClient", _RecordingClient)
+    app.coordinator._online_config = {"nickname": "Alice", "time_minutes": 5,
+                                      "increment_seconds": 0, "side": "random"}
+
+    app.coordinator._on_server_addr_connect("localhost:8000")
+
+    assert len(sent) == 1
+    addr, request = sent[0]
+    assert addr == "localhost:8000"
+    assert request["client_version"] == "2.13.0"
+    assert MatchmakeRequest(**request).client_version == "2.13.0", \
+        "the key has to be the model's field name, or it is silently dropped"
+
+
+def test_a_source_run_states_no_version_and_is_admitted_by_the_gate(monkeypatch):
+    """A checkout ships no assets/version.txt, so get_app_version() answers
+    empty -- and the server's empty-version exemption is what keeps `make run`
+    playable against a deployed server."""
+    app = make_app(1000, 800)
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: "")
+    monkeypatch.setattr(coordinator_module.env, "get_or_create_client_uuid",
+                        lambda: fake_uuid4(7))
+    monkeypatch.setattr(coordinator_module.env, "get_country", lambda: None)
+    monkeypatch.setattr(coordinator_module.env, "get_hide_opp_marks", lambda: False)
+    sent = []
+
+    class _RecordingClient:
+        """Captures the request the same way, for the versionless case."""
+
+        def __init__(self):
+            self.room_id = None
+            self.state = "disconnected"
+
+        def connect(self, addr, request):
+            sent.append(request)
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(coordinator_module, "OnlineClient", _RecordingClient)
+    app.coordinator._online_config = {"nickname": "Alice", "time_minutes": 5,
+                                      "increment_seconds": 0, "side": "random"}
+
+    app.coordinator._on_server_addr_connect("localhost:8000")
+
+    assert sent[0]["client_version"] == ""
+    assert client_version_outdated(sent[0]["client_version"], MIN_CLIENT_VERSION) is False

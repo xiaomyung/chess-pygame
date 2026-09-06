@@ -28,8 +28,9 @@ from chessshootout.server.handlers import (
 from chessshootout.server.protocol import (
     FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS,
     HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS, HealthStatus,
-    IDLE_RESIGN_SECONDS, MAX_INCREMENT_SECONDS, MAX_TIME_MINUTES,
-    MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES, Reason,
+    CLIENT_VERSION_MAX_LEN, IDLE_RESIGN_SECONDS, MAX_INCREMENT_SECONDS,
+    MAX_TIME_MINUTES, MIN_CLIENT_VERSION, MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES,
+    Reason,
 )
 from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
 from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
@@ -128,6 +129,14 @@ def test_root_manifest_names_the_gameserver(client):
     assert "/ws/{room_id}" in body["endpoints"]
 
 
+def test_root_manifest_publishes_the_oldest_accepted_build(client):
+    """MIN_CLIENT_VERSION is a source constant baked into the image, so the
+    manifest is the only way an operator can read back which floor the running
+    container is actually enforcing -- `curl -s <server>/` after a deploy."""
+    body = client.get("/").json()
+    assert body["min_client_version"] == MIN_CLIENT_VERSION
+
+
 def test_health_returns_zero_rooms_initially(client):
     """/healthz exposes status, rooms_active, queue_depth, uptime_s, version, app_version."""
     r = client.get("/healthz")
@@ -160,6 +169,147 @@ def test_matchmake_returns_room_and_token(client):
     assert "room_id" in body and "session_token" in body
 
 
+def test_matchmake_refuses_a_body_stamped_with_another_protocol(client):
+    """Until now no HTTP route checked `version` at all: a build on the previous
+    protocol was paired happily and then fell out at the websocket handshake,
+    which is what left the player watching the search spinner for ever. The
+    refusal is 426 so the client can decide on the status alone."""
+    r = client.post("/matchmake", json={
+        "version": PROTOCOL_VERSION - 1, "client_uuid": ALICE, "nickname": "Alice",
+        "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+    })
+    assert r.status_code == 426
+    assert r.json() == {"detail": {"reason": Reason.VERSION_MISMATCH}}
+    assert client.get("/healthz").json()["queue_depth"] == 0
+
+
+@pytest.mark.parametrize(
+    "client_version",
+    [
+        pytest.param("0.0.1", id="an_old_stamped_build"),
+        pytest.param("garbage", id="a_version_nobody_can_read"),
+        pytest.param("2.13.0-rc1", id="a_decorated_version_is_not_a_version"),
+    ],
+)
+def test_matchmake_refuses_an_outdated_build_and_names_the_floor(client, client_version):
+    """The refusal carries the minimum, because the update card names both
+    numbers and the client only ever learns the server's floor from here."""
+    r = client.post("/matchmake", json={
+        "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+        "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+        "client_version": client_version,
+    })
+    assert r.status_code == 426
+    assert r.json() == {"detail": {"reason": Reason.CLIENT_OUTDATED,
+                                   "min_version": MIN_CLIENT_VERSION}}
+    assert client.get("/healthz").json()["queue_depth"] == 0
+
+
+@pytest.mark.parametrize(
+    "client_version",
+    [
+        pytest.param("", id="a_source_run_states_no_version"),
+        pytest.param(MIN_CLIENT_VERSION, id="exactly_the_minimum"),
+        pytest.param("9.9.9", id="a_build_newer_than_this_server"),
+    ],
+)
+def test_matchmake_admits_every_build_at_or_above_the_floor(client, client_version):
+    """The gate turns away only what it must. The empty version is the
+    source-run exemption -- a checkout ships no version.txt, and the protocol
+    number already turns an incompatible build away -- and a newer build must
+    never be locked out by a server that has not been redeployed yet."""
+    r = client.post("/matchmake", json={
+        "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+        "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+        "client_version": client_version,
+    })
+    assert r.status_code == 200
+
+
+def test_an_outdated_request_leaves_the_senders_existing_room_alone(client, app, clock):
+    """The gate runs before the endpoint's give-up-your-old-seat block, which
+    would otherwise abandon (and finalize as a loss) the game this same uuid is
+    already playing. A downgraded or spoofed build must not be a way to end
+    somebody's live game from outside it."""
+    assert _matchmake(client, uuid=ALICE).status_code == 200
+    assert _matchmake(client, uuid=BOB).status_code == 200
+    rooms = app.state.rooms
+    live = list(rooms._active.values())
+    assert len(live) == 1, "Alice and Bob are paired into one room"
+    live[0].first_move_at = clock()
+    before = rooms.in_progress_room_for(ALICE)
+    assert before is not None, "the game has started, so it is abandonable"
+    room, color = before
+
+    refused = client.post("/matchmake", json={
+        "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+        "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+        "client_version": "0.0.1",
+    })
+
+    assert refused.status_code == 426
+    after = rooms.in_progress_room_for(ALICE)
+    assert after is not None
+    assert after[0] is room and after[1] == color
+    assert room.result is None, "the refused request finalized nothing"
+    assert app.state.rooms.rooms_active == 1
+
+
+def test_a_refused_build_still_spends_its_per_ip_matchmake_allowance(client):
+    """The limiter decorator sits outside the handler, so a 426 costs the same
+    allowance a 200 does. That is the point: refusing outdated builds must not
+    hand an attacker an unmetered endpoint to hammer."""
+    budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
+    payload = {
+        "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+        "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+        "client_version": "0.0.1",
+    }
+    for _ in range(budget):
+        assert client.post("/matchmake", json=payload).status_code == 426
+    limited = client.post("/matchmake", json=payload)
+    assert limited.status_code == 429
+    assert limited.json()["detail"]["reason"] == Reason.RATE_LIMITED
+
+
+def test_the_outdated_refusal_logs_the_parsed_version_and_never_the_raw_text(
+    client, caplog,
+):
+    """`client_version` is attacker-supplied text that reaches an operator's
+    journal, so a newline in it would forge a whole extra log line. The line
+    prints the value re-written from the numbers the server parsed, and prints
+    `unparseable` when there were none -- one record either way."""
+    forged = "2.13.0\nroom created room=x"
+    with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
+        r = client.post("/matchmake", json={
+            "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+            "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+            "client_version": forged,
+        })
+    assert r.status_code == 426
+    records = [rec.getMessage() for rec in caplog.records
+               if rec.name == "chess.server.app"]
+    assert len(records) == 1, f"one record per refused build, got {records}"
+    assert records[0] == (f"matchmake rejected uuid={ALICE[:8]} "
+                          f"reason={Reason.CLIENT_OUTDATED} version=unparseable")
+    assert not any("\n" in message for message in records)
+
+
+def test_the_outdated_refusal_logs_a_readable_version_when_there_is_one(client, caplog):
+    """The other half: a version that parses is named, so the operator can see
+    which build is being turned away rather than only that one was."""
+    with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
+        client.post("/matchmake", json={
+            "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
+            "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+            "client_version": "2.12.2",
+        })
+    records = [rec.getMessage() for rec in caplog.records
+               if rec.name == "chess.server.app"]
+    assert records == [f"matchmake rejected uuid={ALICE[:8]} "
+                       f"reason={Reason.CLIENT_OUTDATED} version=2.12.2"]
+
+
 @pytest.mark.parametrize(
     "body, field",
     [
@@ -187,6 +337,12 @@ def test_matchmake_returns_room_and_token(client):
             {"version": PROTOCOL_VERSION, "client_uuid": ZED, "nickname": "Z",
              "time_minutes": 5, "increment_seconds": MAX_INCREMENT_SECONDS + 1},
             "increment_seconds", id="increment_over_cap",
+        ),
+        pytest.param(
+            {"version": PROTOCOL_VERSION, "client_uuid": ZED, "nickname": "Z",
+             "time_minutes": 5, "increment_seconds": 0,
+             "client_version": "9" * (CLIENT_VERSION_MAX_LEN + 1)},
+            "client_version", id="client_version_too_long",
         ),
     ],
 )

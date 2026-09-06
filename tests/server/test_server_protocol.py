@@ -1,12 +1,16 @@
+import tomllib
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+import chessshootout
 from chessshootout.server.app import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.server.protocol import (
     AnnotationDeltaMessage, AnnotationSetWire, AnnotationsStateMessage, ArrowWire,
-    AuthMessage, CHAT_PRESET_COUNT, ClockSnapshot, ErrorMessage,
+    AuthMessage, CHAT_PRESET_COUNT, CLIENT_VERSION_MAX_LEN, ClockSnapshot, ErrorMessage,
     FIRST_MOVE_ABORT_SECONDS, GameStartMessage, HealthResponse, HealthStatus,
-    IDLE_RESIGN_SECONDS,
+    IDLE_RESIGN_SECONDS, MIN_CLIENT_VERSION,
     IDLE_SECONDS_BY_OUTCOME, IDLE_WINDOW_BY_PLIES, IdleWindowMessage, IdleWindowWire,
     LockWire, MAX_INCREMENT_SECONDS, MAX_SHARED_ARROWS, MAX_SHARED_HIGHLIGHTS,
     MAX_TIME_MINUTES, MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES, MatchmakeRequest,
@@ -14,8 +18,8 @@ from chessshootout.server.protocol import (
     PingMessage, PongMessage, QuickChatMessage, QuickChatReceivedMessage, Reason,
     ResumeResponse, ResyncDirectiveMessage, SkillCheckRequiredMessage,
     SkillCheckResultMessage, SkillCheckOutcomeWire, SkillCheckShotMessage,
-    SkillCheckSpectateMessage, SkillCheckSpectateShotMessage, normalize_country,
-    normalize_nickname,
+    SkillCheckSpectateMessage, SkillCheckSpectateShotMessage, client_version_outdated,
+    normalize_country, normalize_nickname, parse_client_version,
 )
 from tests.helpers import fake_uuid4
 
@@ -352,8 +356,117 @@ def test_clock_snapshot_rejects_an_unknown_running_side():
         ClockSnapshot(white_remaining=1.0, black_remaining=1.0, running_for="green")
 
 
-def test_protocol_version_pinned_for_the_idle_window_push():
-    assert PROTOCOL_VERSION == 5
+def test_protocol_version_pinned_for_the_version_gate():
+    """Bumped to 6 with the matchmake version gate (the resync directive's
+    server_ply rides on the same bump). The pin is what makes a protocol change
+    a deliberate edit: every pre-gate build is on 5 and is refused at /matchmake,
+    and every wire model in this file is stamped with this number."""
+    assert PROTOCOL_VERSION == 6
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        pytest.param("2.13.0", (2, 13, 0), id="plain_release"),
+        pytest.param("10.0.1", (10, 0, 1), id="two_digit_major_is_numeric_not_textual"),
+        pytest.param("0.0.1", (0, 0, 1), id="zeros_are_versions_too"),
+        pytest.param("2.13", None, id="two_parts_is_not_a_version"),
+        pytest.param("2.13.0.1", None, id="four_parts_is_not_a_version"),
+        pytest.param("v2.13.0", None, id="leading_v_refused"),
+        pytest.param("2.13.0-rc1", None, id="prerelease_suffix_refused"),
+        pytest.param("", None, id="empty_string_is_not_a_version"),
+        pytest.param("garbage", None, id="free_text_refused"),
+        pytest.param("٢.١٣.٠", None,
+                     id="arabic_indic_digits_refused_because_the_regex_is_ascii"),
+        pytest.param("2.13.0\n", None, id="trailing_newline_refused"),
+        pytest.param("2.13.0 ", None, id="trailing_space_refused"),
+        pytest.param(f"{'9' * 5000}.0.0", None, id="five_thousand_digit_component"),
+        pytest.param(None, None, id="none_is_not_a_string"),
+        pytest.param(213, None, id="int_is_not_a_string"),
+        pytest.param((2, 13, 0), None, id="tuple_is_not_a_string"),
+        pytest.param(b"2.13.0", None, id="bytes_is_not_a_string"),
+    ],
+)
+def test_parse_client_version_accepts_only_plain_ascii_three_part_versions(raw, expected):
+    """The version a client states is untrusted text off the wire. `\\d` would
+    accept Arabic-Indic digits and `$` would accept a trailing newline, so both
+    are deliberately avoided; the length cap keeps a huge component from ever
+    reaching int(), which raises on very long digit strings."""
+    assert parse_client_version(raw) == expected
+
+
+def test_a_component_at_the_length_cap_still_parses():
+    """The cap bounds the field, it does not reject ordinary versions: the
+    longest string that fits still reads as three numbers."""
+    raw = f"{'9' * (CLIENT_VERSION_MAX_LEN - 4)}.0.0"
+    assert len(raw) == CLIENT_VERSION_MAX_LEN
+    assert parse_client_version(raw) == (int("9" * (CLIENT_VERSION_MAX_LEN - 4)), 0, 0)
+    assert parse_client_version(f"0{raw}") is None
+
+
+@pytest.mark.parametrize(
+    "client_version, minimum, outdated",
+    [
+        pytest.param("2.12.9", "2.13.0", True, id="older_patch_line_is_outdated"),
+        pytest.param("2.9.0", "2.13.0", True,
+                     id="compared_as_numbers_not_as_text_9_is_below_13"),
+        pytest.param("0.0.1", "2.13.0", True, id="far_older_is_outdated"),
+        pytest.param("2.13.0", "2.13.0", False, id="exactly_the_minimum_plays"),
+        pytest.param("2.13.1", "2.13.0", False, id="newer_patch_plays"),
+        pytest.param("3.0.0", "2.13.0", False, id="newer_major_plays"),
+        pytest.param("", "2.13.0", False, id="a_source_run_states_nothing_and_plays"),
+        pytest.param("garbage", "2.13.0", True,
+                     id="a_version_nobody_can_read_is_not_trusted"),
+        pytest.param("٢.١٣.٠", "2.13.0", True, id="unicode_digits_are_not_trusted"),
+        pytest.param("2.13.0", "", False, id="an_empty_minimum_turns_nobody_away"),
+        pytest.param("2.13.0", "garbage", False,
+                     id="an_unreadable_minimum_turns_nobody_away"),
+        pytest.param("2.13.0", "2.13", False,
+                     id="a_two_part_minimum_turns_nobody_away"),
+        pytest.param("0.0.1", "garbage", False,
+                     id="a_broken_minimum_never_locks_even_an_ancient_build_out"),
+    ],
+)
+def test_client_version_outdated_compares_versions_as_numbers(
+    client_version, minimum, outdated,
+):
+    """The gate's whole decision. The empty client version is the source-run
+    exemption and must stay False -- a checkout has no version.txt, and the
+    protocol number is what turns an incompatible build away. A minimum the
+    server itself cannot parse must never refuse anyone, or one typo in the
+    constant closes the server to every player."""
+    assert client_version_outdated(client_version, minimum) is outdated
+
+
+def test_min_client_version_is_readable_and_not_ahead_of_this_build():
+    """MIN_CLIENT_VERSION is a source constant baked into the server image, so a
+    typo there is only caught here. A minimum ahead of the version this repo
+    ships would refuse the very build released alongside it."""
+    repo_root = Path(chessshootout.__file__).resolve().parent.parent
+    pyproject = repo_root / "pyproject.toml"
+    assert pyproject.is_file(), f"expected the project file at {pyproject}"
+    shipped = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    minimum = parse_client_version(MIN_CLIENT_VERSION)
+    current = parse_client_version(shipped)
+    assert minimum is not None, f"MIN_CLIENT_VERSION {MIN_CLIENT_VERSION!r} does not parse"
+    assert current is not None, f"pyproject version {shipped!r} does not parse"
+    assert minimum <= current, (
+        f"MIN_CLIENT_VERSION {MIN_CLIENT_VERSION} is ahead of the shipped {shipped}")
+
+
+def test_matchmake_client_version_is_bounded_and_optional():
+    """The field is attacker-supplied and reaches a log line, so its length is
+    capped at the model boundary rather than in the endpoint. It defaults to
+    empty, which is exactly what a source run sends."""
+    assert MatchmakeRequest(nickname="A", client_uuid=U1, time_minutes=5,
+                            increment_seconds=0).client_version == ""
+    at_cap = "9" * CLIENT_VERSION_MAX_LEN
+    assert MatchmakeRequest(nickname="A", client_uuid=U1, time_minutes=5,
+                            increment_seconds=0,
+                            client_version=at_cap).client_version == at_cap
+    with pytest.raises(ValidationError):
+        MatchmakeRequest(nickname="A", client_uuid=U1, time_minutes=5,
+                         increment_seconds=0, client_version="9" * (CLIENT_VERSION_MAX_LEN + 1))
 
 
 def test_idle_window_table_is_the_single_source_of_policy():

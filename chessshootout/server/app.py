@@ -37,10 +37,11 @@ from chessshootout.server.protocol import (
     ConnectionStatusMessage, ErrorMessage, GRACE_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS,
     HealthResponse, HealthStatus, HistoryEntryWire, LockWire,
-    MatchmakeRequest, MatchmakeResponse,
+    MIN_CLIENT_VERSION, MatchmakeRequest, MatchmakeResponse,
     PROTOCOL_VERSION, PendingSkillCheckWire, Reason, ReasonEnvelope, ReclaimRequest,
     ReclaimResponse, RematchRequestMessage, RematchUpdateMessage,
-    ResultMessage, ResumeRequest, ResumeResponse, SkillCheckOutcomeWire, is_uuid4,
+    ResultMessage, ResumeRequest, ResumeResponse, SkillCheckOutcomeWire,
+    client_version_outdated, is_uuid4, parse_client_version,
 )
 from chessshootout.server.rooms import (
     AlreadyInGameError, GameAlreadyStartedError, InvalidTokenError, NotInRoomError,
@@ -419,15 +420,18 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
     @app.get("/")
     async def root() -> dict[str, Any]:
         """
-        Service manifest for the game server: which protocol version it speaks
-        and which endpoints it offers. A useful first call to confirm that a
-        client and a server are talking the same protocol
+        Service manifest for the game server: which protocol version it speaks,
+        the oldest build of the game it still accepts, and which endpoints it
+        offers. A useful first call to confirm that a client and a server are
+        talking the same protocol
 
-        :returns: the service name, the protocol version and the endpoint list
+        :returns: the service name, the protocol version, the oldest accepted
+            build version and the endpoint list
         """
         return {
             "service": "gameserver",
             "version": PROTOCOL_VERSION,
+            "min_client_version": MIN_CLIENT_VERSION,
             "endpoints": ["/healthz", "/matchmake", "/resume", "/reclaim", "/ws/{room_id}"],
         }
 
@@ -477,15 +481,29 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         Ask to be paired for an online game. Someone already waiting on the same
         time control is matched immediately; otherwise the request holds a place
         until an opponent arrives. Any game or waiting place the same player
-        still holds is given up first, so a player is only ever in one game
+        still holds is given up first, so a player is only ever in one game. A
+        build that speaks another protocol version, or one older than this
+        server accepts, is turned away before any of that happens
 
         :param request: the incoming HTTP request; the endpoint itself reads
             only the body
-        :param body: who is asking, the time control wanted and which side they
-            would prefer to play
+        :param body: who is asking, which build they run, the time control
+            wanted and which side they would prefer to play
         :returns: the room to open the game connection on, with the session
             token for it
         """
+        if body.version != PROTOCOL_VERSION:
+            raise HTTPException(status_code=426,
+                                detail={"reason": Reason.VERSION_MISMATCH})
+        if client_version_outdated(body.client_version, MIN_CLIENT_VERSION):
+            parsed = parse_client_version(body.client_version)
+            log.info("matchmake rejected uuid=%s reason=%s version=%s",
+                     body.client_uuid[:8], Reason.CLIENT_OUTDATED,
+                     "unparseable" if parsed is None
+                     else ".".join(str(part) for part in parsed))
+            raise HTTPException(status_code=426,
+                                detail={"reason": Reason.CLIENT_OUTDATED,
+                                        "min_version": MIN_CLIENT_VERSION})
         log.info("matchmake nickname=%s uuid=%s tc=%s+%s side=%s",
                  body.nickname, body.client_uuid[:8],
                  body.time_minutes, body.increment_seconds, body.side_preference)

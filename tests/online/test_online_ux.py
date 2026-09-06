@@ -18,6 +18,7 @@ from tests.conftest import pygame_display
 from tests.helpers import online_start_payload
 from chessshootout.backend.utils import BOARD_SIZE
 from chessshootout.frontend.frontend import Frontend
+from chessshootout.frontend import online_coordinator as coordinator_module
 from chessshootout.frontend.online_coordinator import RECONNECT_MODAL_DEBOUNCE_MS
 from chessshootout.frontend.screens.game import (
     ANIM_MS_DEFAULT, ANIM_MS_MIN, ANIM_MS_MAX, compute_animation_ms,
@@ -25,10 +26,12 @@ from chessshootout.frontend.screens.game import (
 from chessshootout.frontend.visual.colors import Colors
 from chessshootout.frontend.modals.reconnecting import ReconnectingModal
 from chessshootout.frontend.online_coordinator import (
-    MATCH_FOUND_SECONDS, NOT_YOUR_TURN_TOASTS, ONLINE_HARD_FAILURE_LABELS,
-    ONLINE_HARD_FAILURE_REASONS, ONLINE_TRANSIENT_REASON_LABELS,
+    MATCH_FOUND_SECONDS, NOT_YOUR_TURN_TOASTS, ONLINE_GAME_STATE_REASONS,
+    ONLINE_HARD_FAILURE_LABELS, ONLINE_HARD_FAILURE_REASONS,
+    ONLINE_TRANSIENT_REASON_LABELS, UPDATE_REQUIRED_PROTOCOL_SUB,
+    UPDATE_REQUIRED_TITLE, UPDATE_REQUIRED_UNKNOWN_SUB,
 )
-from chessshootout.server.protocol import Reason
+from chessshootout.server.protocol import PROTOCOL_VERSION, Reason
 
 
 _pygame_init = pygame_display(600, 400)
@@ -260,6 +263,114 @@ def test_hard_failure_shows_confirm_modal_with_friendly_label(
     assert frontend.confirm_modal.title == expected_title
     assert reason not in frontend.confirm_modal.title
     assert frontend.toast.is_visible() is False
+
+
+def test_an_outdated_build_shows_the_update_card_naming_both_versions(
+    frontend, monkeypatch,
+):
+    """The client_outdated wording is built from two PARSED versions, so the
+    card can only ever print numbers this build understood."""
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: "2.12.2")
+    frontend.coordinator.wait_modal.show("Blitz", "5 + 0", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error(
+        {"reason": Reason.CLIENT_OUTDATED, "min_version": "2.13.0"})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == (
+        "You run v2.12.2 · this server needs v2.13.0 or newer — update your install")
+    assert frontend.confirm_modal.yes_label == "OK"
+    assert frontend.confirm_modal.emoji is None
+    assert not frontend.coordinator.wait_modal.is_visible(), \
+        "the search card comes down, or the player watches a dead spinner"
+    assert not frontend.toast.is_visible()
+
+
+@pytest.mark.parametrize(
+    "app_version, payload",
+    [
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED,
+                                "min_version": "9.9.9\nUpdate at evil.example"},
+                     id="a_forged_minimum_is_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED,
+                                "min_version": "‮drop everything"},
+                     id="control_characters_are_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED, "min_version": 213},
+                     id="a_minimum_that_is_not_text_is_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED},
+                     id="no_minimum_named_at_all"),
+        pytest.param("", {"reason": Reason.CLIENT_OUTDATED, "min_version": "2.13.0"},
+                     id="a_source_run_has_no_version_of_its_own_to_name"),
+    ],
+)
+def test_the_update_card_falls_back_rather_than_print_an_unparsed_version(
+    frontend, monkeypatch, app_version, payload,
+):
+    """The sub-line is server-influenced text drawn full width on the player's
+    screen. Anything that does not parse as a version drops the whole sentence
+    for the generic one instead of being echoed."""
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: app_version)
+
+    frontend.coordinator._handle_online_error(payload)
+
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == UPDATE_REQUIRED_UNKNOWN_SUB
+
+
+def test_a_protocol_gap_shows_the_update_card_with_direction_neutral_copy(frontend):
+    """version_mismatch used to be swallowed by ONLINE_GAME_STATE_REASONS: the
+    search card stayed up and spun for ever. It is an update card now, worded
+    without blaming either side, since which of the two is older cannot be told
+    from a refusal that names no server version."""
+    frontend.coordinator.wait_modal.show("Blitz", "5 + 0", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error({"reason": Reason.VERSION_MISMATCH})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == UPDATE_REQUIRED_PROTOCOL_SUB
+    assert str(PROTOCOL_VERSION) in frontend.confirm_modal.sub
+    assert not frontend.coordinator.wait_modal.is_visible()
+    assert Reason.VERSION_MISMATCH not in ONLINE_GAME_STATE_REASONS
+
+
+@pytest.mark.parametrize(
+    "button",
+    [
+        pytest.param("yes", id="the_ok_button"),
+        pytest.param("no", id="the_second_button_of_the_shared_shell"),
+    ],
+)
+def test_dismissing_the_update_card_puts_the_player_back_on_the_play_card(
+    frontend, monkeypatch, button,
+):
+    """The confirm shell always draws two buttons, so BOTH are wired to the same
+    cancel: whichever one is clicked, the search is given up and the menu's play
+    card comes back. A button that only hid the box would strand the player on a
+    menu with no play card on it."""
+    cancelled = []
+    monkeypatch.setattr(frontend.coordinator, "_on_online_cancel",
+                        lambda: cancelled.append(True))
+
+    frontend.coordinator._handle_online_error({"reason": Reason.CLIENT_OUTDATED})
+    frontend.confirm_modal.draw()
+    frontend.confirm_modal.handle_click(
+        frontend.confirm_modal.button_rects[button].center)
+
+    assert cancelled == [True]
+    assert not frontend.confirm_modal.is_visible()
+
+
+def test_the_update_card_is_shown_once_per_refusal(frontend, caplog):
+    """One refusal, one card and one WARNING -- the client stops after the
+    refusal, so a repeat here would mean something re-entered the branch."""
+    with caplog.at_level(logging.WARNING, logger="chess.frontend"):
+        frontend.coordinator._handle_online_error({"reason": Reason.CLIENT_OUTDATED})
+    warnings = [rec.getMessage() for rec in caplog.records
+                if rec.getMessage().startswith("online update required")]
+    assert warnings == [f"online update required reason={Reason.CLIENT_OUTDATED}"]
+    assert frontend.confirm_modal.is_visible()
 
 
 def test_room_lost_shows_new_search_modal(frontend, monkeypatch):

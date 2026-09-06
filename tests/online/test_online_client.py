@@ -10,7 +10,7 @@ from chessshootout.online.client import (
     OnlineClient, PING_SAMPLE_WINDOW, RECONNECT_BACKOFF_MAX_SECONDS,
     SERVER_FULL_RETRIES)
 from chessshootout.online.transport import (
-    SchemaVersionMismatch,
+    ClientOutdated, SchemaVersionMismatch,
     ServerTransport, TransportError, _UrlBuilder, _split_addr, WsConnectionClosed)
 
 
@@ -314,6 +314,80 @@ def test_matchmake_raises_a_protocol_mismatch_at_once_without_retrying(monkeypat
         asyncio.run(client._matchmake_with_retries(request))
 
     assert attempts["n"] == 1, "a rejection on the merits is not retried"
+
+
+def test_an_outdated_build_is_refused_at_once_without_retrying(monkeypatch):
+    """ClientOutdated subclasses SchemaVersionMismatch, so the existing `raise`
+    arm already covers it -- pinned because a second, narrower arm added below
+    the broad one would be dead, and dropping the broad one would put an
+    outdated build back on the four-attempt retry loop."""
+    attempts = {"n": 0}
+
+    def outdated(request):
+        attempts["n"] += 1
+        return httpx.Response(426, json={"detail": {"reason": "client_outdated",
+                                                    "min_version": "2.13.0"}})
+
+    async def fake_sleep(d):
+        raise AssertionError("an outdated build must not be retried")
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OnlineClient()
+    client._transport = ServerTransport(
+        "localhost:8000",
+        async_http_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(outdated)))
+    request = {"nickname": "Alice", "client_uuid": "00000000-0000-4000-8000-000000000000",
+               "time_minutes": 5, "increment_seconds": 0}
+
+    with pytest.raises(ClientOutdated) as info:
+        asyncio.run(client._matchmake_with_retries(request))
+
+    assert attempts["n"] == 1
+    assert info.value.min_version == "2.13.0"
+
+
+@pytest.mark.parametrize(
+    "status, body, expected",
+    [
+        pytest.param(426, {"detail": {"reason": "client_outdated",
+                                      "min_version": "2.13.0"}},
+                     {"reason": "client_outdated", "min_version": "2.13.0"},
+                     id="outdated_build_names_the_floor"),
+        pytest.param(426, {"detail": {"reason": "client_outdated"}},
+                     {"reason": "client_outdated", "min_version": ""},
+                     id="outdated_build_with_no_floor_named"),
+        pytest.param(426, {"detail": {"reason": "version_mismatch"}},
+                     {"reason": "version_mismatch"},
+                     id="protocol_gap_carries_no_version"),
+    ],
+)
+def test_a_refused_build_publishes_one_error_event_and_stops(monkeypatch, status,
+                                                             body, expected):
+    """The session must END rather than sit in `connecting`, and the event has to
+    carry the floor for the update card -- this is the eternal-spinner fix seen
+    from the client's side."""
+    async def fake_sleep(d):
+        raise AssertionError("a refused build must not be retried")
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OnlineClient()
+    client._addr = "localhost:8000"
+    client._transport = ServerTransport(
+        "localhost:8000",
+        async_http_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status, json=body))))
+
+    asyncio.run(client._async_main(
+        {"nickname": "Alice", "client_uuid": "00000000-0000-4000-8000-000000000000",
+         "time_minutes": 5, "increment_seconds": 0}))
+
+    events = client.drain_inbound()
+    assert [(ev.type, ev.payload) for ev in events] == [("error", expected)]
+    assert client.state == "disconnected"
 
 
 def test_send_loop_survives_a_send_error_and_keeps_going():

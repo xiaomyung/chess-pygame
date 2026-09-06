@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pygame as pg
 
+from chessshootout import paths
 from chessshootout.backend.utils import Square, coord_from_square, square_from_coord
 from chessshootout.domain.pgn.load import time_category_for_minutes
 from chessshootout.frontend.modals.match_found import MatchFoundModal
@@ -21,7 +22,8 @@ from chessshootout.online.client import (
     probe_active_game,
 )
 from chessshootout.server.protocol import (
-    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, Reason,
+    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, PROTOCOL_VERSION, Reason,
+    parse_client_version,
 )
 from chessshootout.skillcheck.wheel import SKILLCHECK_DEADLINE_MS
 
@@ -76,8 +78,17 @@ ONLINE_TRANSIENT_REASON_LABELS = {
 
 ONLINE_GAME_STATE_REASONS = {
     Reason.NOT_YOUR_TURN, Reason.INVALID_MOVE_FORMAT, Reason.INVALID_MESSAGE,
-    Reason.VERSION_MISMATCH,
 }
+
+UPDATE_REQUIRED_REASONS = frozenset({Reason.CLIENT_OUTDATED, Reason.VERSION_MISMATCH})
+
+UPDATE_REQUIRED_TITLE = "Update required"
+UPDATE_REQUIRED_BUTTON = "OK"
+UPDATE_REQUIRED_UNKNOWN_SUB = "This server needs a newer build — update your install"
+UPDATE_REQUIRED_PROTOCOL_SUB = (
+    f"This server and this build speak different versions "
+    f"(server v?, client v{PROTOCOL_VERSION}) — update your install"
+)
 
 MOVE_REJECTION_REASONS = {
     Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN, Reason.SKILLCHECK_PENDING,
@@ -87,6 +98,17 @@ MOVE_REJECTION_REASONS = {
 NOT_YOUR_TURN_TOASTS = {
     "takeback_request": "Take back is only available right after your move",
 }
+
+
+def _version_text(parsed: tuple[int, int, int]) -> str:
+    """
+    Write a version back out from the numbers it was read as, so only values
+    this build has parsed itself can ever reach the screen
+
+    :param parsed: the three version numbers
+    :returns: the version as major.minor.patch
+    """
+    return ".".join(str(part) for part in parsed)
 
 
 class ResyncCause:
@@ -483,8 +505,9 @@ class OnlineCoordinator:
         """
         Decide what a rejection or failure from the server should look like to
         the player: silence for ordinary game-state answers, a toast for
-        transient ones, a confirm dialog with Retry for the hard failures. A
-        reason string the server supplied is truncated before it reaches a toast
+        transient ones, an update card for a build the server will not take, and
+        a confirm dialog with Retry for the hard failures. A reason string the
+        server supplied is truncated before it reaches a toast
 
         :param payload: error message, keyed by reason plus the message type it
             is answering
@@ -533,6 +556,20 @@ class OnlineCoordinator:
             self._on_online_cancel()
             self.app.toast.show(ONLINE_TRANSIENT_REASON_LABELS[reason])
             return
+        if reason in UPDATE_REQUIRED_REASONS:
+            log.warning("online update required reason=%s", reason)
+            self._end_resync(replay=False)
+            self.wait_modal.hide()
+            self.match_found_modal.hide()
+            self.offer_banners.clear()
+            self.app.confirm_modal.show(
+                UPDATE_REQUIRED_TITLE,
+                on_yes=self._on_online_cancel,
+                on_no=self._on_online_cancel,
+                yes_label=UPDATE_REQUIRED_BUTTON,
+                sub=self._update_required_sub(reason, payload),
+            )
+            return
         if reason in ONLINE_HARD_FAILURE_REASONS or reason.startswith("http_"):
             log.warning("online hard failure reason=%s", reason)
             self._end_resync(replay=False)
@@ -554,6 +591,28 @@ class OnlineCoordinator:
             self.app.toast.show(label)
         else:
             self.app.toast.show("Server error")
+
+    def _update_required_sub(self, reason: str, payload: dict[str, Any]) -> str:
+        """
+        Word the update card for the refusal that was actually hit: an outdated
+        build names both versions, a protocol the server does not speak names
+        what this build speaks. Every number is written back out of a parsed
+        value, so a server answering with text where a version belongs cannot
+        put that text on the player's screen
+
+        :param reason: the refusal code, an outdated build or a protocol gap
+        :param payload: the error event, which may name the oldest build the
+            server still accepts
+        :returns: the explanation drawn under the title
+        """
+        if reason != Reason.CLIENT_OUTDATED:
+            return UPDATE_REQUIRED_PROTOCOL_SUB
+        mine = parse_client_version(paths.get_app_version())
+        minimum = parse_client_version(payload.get("min_version"))
+        if mine is None or minimum is None:
+            return UPDATE_REQUIRED_UNKNOWN_SUB
+        return (f"You run v{_version_text(mine)} · this server needs "
+                f"v{_version_text(minimum)} or newer — update your install")
 
     def _opp_name(self) -> str:
         """
@@ -1078,6 +1137,7 @@ class OnlineCoordinator:
         request = {
             "nickname": (config.get("nickname") or "").strip() or "Player",
             "client_uuid": env.get_or_create_client_uuid(),
+            "client_version": paths.get_app_version(),
             "time_minutes": config["time_minutes"] or ONLINE_DEFAULT_TIME_MINUTES,
             "increment_seconds": config["increment_seconds"],
             "side_preference": config["side"],
