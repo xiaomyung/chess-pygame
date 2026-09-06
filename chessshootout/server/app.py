@@ -879,16 +879,14 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
     :param websocket: accepted socket for this player
     :param room_id: room the socket connected to
     """
-    rooms = app.state.rooms
-    connections = app.state.connections
+    rooms: RoomManager = app.state.rooms
+    connections: ConnectionRegistry = app.state.connections
     auth = await _authenticate_ws(websocket, rooms, room_id)
     if auth is None:
         return
-    room, color, slot = auth
-    auth_room = room
-    auth_color = color
+    room, auth_color, slot = auth
     auth_uuid = slot.client_uuid
-    rooms.mark_connected(room.room_id, color)
+    rooms.mark_connected(room.room_id, auth_color)
     displaced = connections.add(room.room_id, auth_uuid, websocket)
     if displaced is not None:
         try:
@@ -896,16 +894,16 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
         except (RuntimeError, WebSocketDisconnect) as exc:
             log.debug("ws close on supersede failed: %s", exc)
     log.info("ws auth ok room=%s uuid=%s tentative_color=%s paired=%s has_both=%s",
-             room.room_id, auth_uuid[:8], color, room.is_paired(),
+             room.room_id, auth_uuid[:8], auth_color, room.is_paired(),
              connections.has_both(room))
 
     if room.result is not None:
         slot.at_result = True
         reason, winner = room.result
         await send(websocket, ResultMessage(reason=reason, winner_color=winner))
-        if room.opp_color(color) in room.rematch_offered_by:
+        if room.opp_color(auth_color) in room.rematch_offered_by:
             await send(websocket, RematchRequestMessage())
-        opp_ws = connections.get_for_color(room, room.opp_color(color))
+        opp_ws = connections.get_for_color(room, room.opp_color(auth_color))
         if opp_ws is not None:
             await send(opp_ws, RematchUpdateMessage(event="opponent_returned"))
     elif room.is_paired() and connections.has_both(room) and not room.game_start_broadcast:
@@ -913,7 +911,7 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
             room.started_at = app.state.now()
         await broadcast_game_start(connections, room, app.state.now)
     else:
-        opp_ws = connections.get_for_color(room, room.opp_color(color))
+        opp_ws = connections.get_for_color(room, room.opp_color(auth_color))
         if opp_ws is not None:
             await send(opp_ws, ConnectionStatusMessage(opp_state="connected"))
         if room.game_start_broadcast:
@@ -933,11 +931,11 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
                 break
             except RuntimeError as exc:
                 log.debug("ws recv on superseded/closed socket room=%s color=%s: %s",
-                          room.room_id, color, exc)
+                          room.room_id, auth_color, exc)
                 break
             except Exception:
                 log.exception("ws recv failed room=%s color=%s",
-                              room.room_id, room.color_of(auth_uuid) or color)
+                              room.room_id, room.color_of(auth_uuid) or auth_color)
                 break
             if _over_inbound_cap(raw):
                 await websocket.close(code=WS_CLOSE_PAYLOAD_TOO_LARGE)
@@ -945,7 +943,7 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
             current_color = room.color_of(auth_uuid)
             if current_color is None:
                 break
-            rooms.touch_seen(auth_room.room_id, current_color)
+            rooms.touch_seen(room.room_id, current_color)
             if not ws_rate_limiter.hit(auth_uuid):
                 await send(websocket, ErrorMessage(reason=Reason.RATE_LIMITED))
                 continue
@@ -955,15 +953,15 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
                       room.room_id, auth_uuid[:8], msg_type,
                       (app.state.now() - t0) * 1000.0, outcome)
     finally:
-        removed = connections.remove(auth_room.room_id, auth_uuid, websocket)
-        cur_color = auth_room.color_of(auth_uuid) or auth_color
-        if removed or connections.get_for_color(auth_room, cur_color) is None:
-            rooms.mark_disconnected(auth_room.room_id, cur_color)
+        removed = connections.remove(room.room_id, auth_uuid, websocket)
+        exit_color = room.color_of(auth_uuid) or auth_color
+        if removed or connections.get_for_color(room, exit_color) is None:
+            rooms.mark_disconnected(room.room_id, exit_color)
             log.info("ws disconnected room=%s color=%s",
-                     auth_room.room_id, cur_color)
-            opp_ws = connections.get_for_color(auth_room, auth_room.opp_color(cur_color))
+                     room.room_id, exit_color)
+            opp_ws = connections.get_for_color(room, room.opp_color(exit_color))
             if opp_ws is not None:
                 msg = (ConnectionStatusMessage(opp_state="reconnecting")
-                       if auth_room.result is None
+                       if room.result is None
                        else RematchUpdateMessage(event="opponent_reconnecting"))
                 await send(opp_ws, msg)
