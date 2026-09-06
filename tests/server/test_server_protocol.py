@@ -38,8 +38,8 @@ GAME_START = GameStartMessage(
             id="ping",
         ),
         pytest.param(
-            ResyncDirectiveMessage(),
-            {"version": PROTOCOL_VERSION, "type": "resync_directive"},
+            ResyncDirectiveMessage(server_ply=12),
+            {"version": PROTOCOL_VERSION, "type": "resync_directive", "server_ply": 12},
             id="resync_directive",
         ),
         pytest.param(
@@ -79,11 +79,40 @@ def test_message_round_trip_matches_independent_wire_shape(msg, expected):
         pytest.param(ErrorMessage(reason="version_mismatch"), id="error"),
         pytest.param(PingMessage(ply=0), id="ping"),
         pytest.param(PongMessage(), id="pong"),
-        pytest.param(ResyncDirectiveMessage(), id="resync_directive"),
+        pytest.param(ResyncDirectiveMessage(server_ply=0), id="resync_directive"),
     ],
 )
 def test_messages_carry_protocol_version(msg):
     assert msg.version == PROTOCOL_VERSION
+
+
+def test_a_heartbeat_without_a_ply_is_a_client_that_is_off_the_board():
+    """The default has to be None rather than 0: a heartbeat from a client that
+    is not on a live board must claim nothing, and 0 is a real ply that a fresh
+    game legitimately sits on."""
+    assert PingMessage().ply is None
+    assert PingMessage.model_validate_json('{"type": "ping"}').ply is None
+    assert PingMessage.model_validate_json('{"type": "ping", "ply": null}').ply is None
+
+
+def test_a_heartbeat_ply_is_bounded_at_zero():
+    """`ply` is client-supplied, so it is bounded by the model rather than by
+    hand in the handler -- a negative ply can never match and would otherwise
+    walk straight into the strike counter."""
+    assert PingMessage.model_validate_json('{"type": "ping", "ply": 0}').ply == 0
+    with pytest.raises(ValidationError):
+        PingMessage(ply=-1)
+
+
+def test_a_resync_directive_always_names_the_ply_it_was_written_against():
+    """The client drops a directive it has already outrun by comparing this
+    against its own ply, so the field is required rather than defaulted -- a
+    default would make every directive look like it was about ply 0."""
+    with pytest.raises(ValidationError):
+        ResyncDirectiveMessage()
+    parsed = ResyncDirectiveMessage.model_validate_json(
+        '{"type": "resync_directive", "server_ply": 4}')
+    assert parsed.server_ply == 4
 
 
 @pytest.mark.parametrize(

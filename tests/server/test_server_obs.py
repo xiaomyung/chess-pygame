@@ -16,7 +16,10 @@ from httpx import ASGITransport, AsyncClient
 from chessshootout.server.app import (
     PROTOCOL_VERSION, WS_MESSAGES_PER_SECOND, _ws_session,
 )
-from chessshootout.server.handlers import HANDLERS, dispatch
+from chessshootout.server.broadcasts import broadcast_game_start
+from chessshootout.server.handlers import (
+    HANDLERS, RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS, dispatch,
+)
 from chessshootout.server.protocol import GRACE_SECONDS, IDLE_RESIGN_SECONDS, Reason
 from chessshootout.server.sweep import PREGAME_CONNECT_GRACE_SECONDS
 from tests.server.conftest import ALICE, BOB, auth_msg
@@ -168,6 +171,30 @@ async def test_dispatch_returns_invalid_message_for_unknown_type(app):
     assert msg_type == "made_up"
     assert outcome == "invalid_message"
     assert any(p.get("reason") == Reason.INVALID_MESSAGE for p in ws.sent)
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_outcome_separates_a_tolerated_ply_from_a_directed_one(
+    app, clock,
+):
+    """The outcome word is the only place a tolerated mismatch is visible in
+    production: prod runs at INFO, and both cases used to return the same
+    `ping`. The identical heartbeat now reads as `ping_inflight` while the move
+    is still in flight and `ping_directed` once it plainly is not, and the
+    dispatch line carries that word verbatim (pinned above for `move`)."""
+    room, ws_w, ws_b = await _wired_room(app)
+    await broadcast_game_start(app.state.connections, room, clock)
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+    await _play(app, room, ws_w, ws_b, [("e2", "e4")])
+
+    _, inflight = await dispatch(app, ws_b, room, "black", _msg(type="ping", ply=0))
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+    outcomes = [await dispatch(app, ws_b, room, "black", _msg(type="ping", ply=0))
+                for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS)]
+
+    assert inflight == "ping_inflight"
+    assert [o for _, o in outcomes] == (
+        ["ping_strike"] * (RESYNC_STABLE_MISMATCH_HEARTBEATS - 1) + ["ping_directed"])
 
 
 FINALIZE_PREFIX = "game finalized"

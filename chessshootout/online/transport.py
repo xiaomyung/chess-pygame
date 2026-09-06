@@ -637,13 +637,14 @@ class ServerWebSocket:
         """
         await self._send(GiveTimeMessage(hold_ms=hold_ms))
 
-    async def send_ping(self, ply: int) -> None:
+    async def send_ping(self, ply: int | None) -> None:
         """
         Send the heartbeat that keeps the connection alive and reports which
         ply this client thinks it is on, which is how the server notices a
         board that has fallen behind and repairs it
 
-        :param ply: number of half-moves this client has applied.
+        :param ply: number of half-moves this client has applied, or None while
+            it is not sitting on a live online board and has no ply to claim.
         """
         await self._send(PingMessage(ply=ply))
 

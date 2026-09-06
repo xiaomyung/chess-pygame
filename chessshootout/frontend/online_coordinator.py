@@ -89,6 +89,22 @@ NOT_YOUR_TURN_TOASTS = {
 }
 
 
+class ResyncCause:
+    """
+    The closed set of reasons this client rebuilds a game from the server. Every
+    resync names one, so the crash log says what actually went wrong instead of
+    only that something did
+    """
+
+    SERVER_DIRECTIVE = "server_directive"
+    MOVE_REJECTED = "move_rejected"
+    MOVE_PLY_GAP = "move_ply_gap"
+    MOVE_ILLEGAL = "move_illegal"
+    TAKEBACK_PLY_GAP = "takeback_ply_gap"
+    VERDICT_LOST = "verdict_lost"
+    RESULT_APPLY_FAILED = "result_apply_failed"
+
+
 class OnlineCoordinator:
     """
     The client side of an online match, from the search for an opponent all the
@@ -432,7 +448,7 @@ class OnlineCoordinator:
         elif event.type == "idle_window":
             self._handle_idle_window(event.payload)
         elif event.type == "resync_directive":
-            self._begin_resync()
+            self._handle_resync_directive(event.payload)
         elif event.type == "skill_check_required":
             self._handle_skill_check_required(event.payload)
         elif event.type == "skill_check_result":
@@ -443,6 +459,25 @@ class OnlineCoordinator:
             self._handle_skill_check_spectate_shot(event.payload)
         elif event.type == "error":
             self._handle_online_error(event.payload)
+
+    def _handle_resync_directive(self, payload: dict[str, Any]) -> None:
+        """
+        Obey the server's order to rebuild the game, unless this client has
+        already caught up to the very ply the order was written against -- an
+        order the network delayed past its own answer. Anything unreadable in
+        the payload is treated as an order worth obeying
+
+        :param payload: resync-directive message, carrying the ply the server
+            was on when it decided.
+        """
+        server_ply = payload.get("server_ply")
+        client_ply = self._heartbeat_ply()
+        if (isinstance(server_ply, int) and client_ply is not None
+                and server_ply == client_ply):
+            log.debug("resync directive server_ply=%d stale=True", server_ply)
+            return
+        log.warning("resync directive server_ply=%s", server_ply)
+        self._begin_resync(ResyncCause.SERVER_DIRECTIVE)
 
     def _handle_online_error(self, payload: dict[str, Any]) -> None:
         """
@@ -463,7 +498,11 @@ class OnlineCoordinator:
             game.skillcheck_session.pending_online_move = None
             game.board.selected_square = None
             if reason in (Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN):
-                self._begin_resync()
+                self._begin_resync(ResyncCause.MOVE_REJECTED)
+            return
+        if (reason in (Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN)
+                and payload.get("msg_type") == "move"):
+            self._begin_resync(ResyncCause.MOVE_REJECTED)
             return
         if reason == Reason.NOT_YOUR_TURN:
             label = NOT_YOUR_TURN_TOASTS.get(cast(str, payload.get("msg_type")))
@@ -677,14 +716,19 @@ class OnlineCoordinator:
             on_yes=respond(True), on_no=respond(False),
         )
 
-    def _begin_resync(self) -> None:
+    def _begin_resync(self, cause: str) -> None:
         """
         Start rebuilding the whole game from the server after a suspected
         desync, asking for a fresh snapshot and holding board events back until
-        it lands. Asking again while one is already running does nothing
+        it lands. Asking again while one is already running does nothing, so the
+        one line it writes marks the start of a repair, not every attempt
+
+        :param cause: which ResyncCause member sent us here.
         """
         if self._resyncing:
             return
+        log.warning("resync begin cause=%s client_ply=%d",
+                    cause, len(self.app.game.match.move_history))
         self._resyncing = True
         self.offer_banners.clear()
         self._resync_started_at_ms = pg.time.get_ticks()
@@ -1238,12 +1282,31 @@ class OnlineCoordinator:
             game._local_disconnected_at_ms = None
         self._prev_online_state = current
 
+    def _heartbeat_ply(self) -> int | None:
+        """
+        Work out which ply this client can honestly claim to be showing. Only a
+        live online board that is actually on screen and not still behind the
+        match-found card has one; anywhere else the heartbeat claims nothing, so
+        the server judges nothing
+
+        :returns: half-moves applied on the online board, or None when this
+            client is not sitting on one.
+        """
+        game = self.app.game
+        if (self.app.screen is not game or game.variant != Variant.ONLINE
+                or self._pending_game_start_payload is not None):
+            return None
+        return len(game.match.move_history)
+
     def _send_heartbeat_if_due(self) -> None:
         """
         Keep the connection alive on the interval the server asked for, and
-        carry this client's ply count in every ping so the server can notice a
-        client lagging behind and answer with a resync directive, debounced on
-        its side. A server that has gone silent is escalated to a reconnect
+        carry the ply this client is honestly on in every ping so the server can
+        notice a board lagging behind and answer with a resync directive,
+        debounced on its side. Nothing is sent while a skill-check verdict is
+        still to be applied, since that window is exactly when the two sides
+        legitimately disagree. A server that has gone silent is escalated to a
+        reconnect
         """
         if self.client is None or not self.client.is_connected():
             return
@@ -1257,7 +1320,7 @@ class OnlineCoordinator:
         now = pg.time.get_ticks()
         if now - self._last_heartbeat_sent_ms >= self.client.heartbeat_interval() * 1000:
             self._last_heartbeat_sent_ms = now
-            self.client.send_ping(len(game.match.move_history))
+            self.client.send_ping(self._heartbeat_ply())
 
     def _update_heartbeat(self) -> None:
         """
@@ -1329,9 +1392,8 @@ class OnlineCoordinator:
             return
         elapsed = pg.time.get_ticks() - session.online_skillcheck_opened_ms
         if elapsed > SKILLCHECK_DEADLINE_MS + SKILLCHECK_WATCHDOG_SLACK_MS:
-            log.warning("skillcheck verdict lost; resyncing")
             session.teardown_skillcheck_overlay()
-            self._begin_resync()
+            self._begin_resync(ResyncCause.VERDICT_LOST)
 
     def _update_online_phase(self) -> None:
         """
@@ -1517,10 +1579,13 @@ class OnlineCoordinator:
         """
         Rebuild a whole game out of a server snapshot -- menu settings, board,
         clocks, marks and any pending skill check -- as one step, so a half
-        restored game can never be left on screen
+        restored game can never be left on screen. Any pairing still waiting
+        behind the match-found card is dropped with it, since the snapshot is
+        now the board this client is on
 
         :param resume: resume snapshot fetched from the server
         """
+        self._pending_game_start_payload = None
         self.app.menu.apply_resume_config(resume)
         self._start_online_game(resume)
         self._handle_game_resumed(resume)

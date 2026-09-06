@@ -15,11 +15,12 @@ from chessshootout.server.app import (
     UuidRateLimiter, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
     WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED, create_app,
 )
-from chessshootout.server.broadcasts import idle_window_wire
+from chessshootout.server.broadcasts import broadcast_game_start, idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
 from chessshootout.server.handlers import (
     RESYNC_DIRECTIVE, RESYNC_GATE_PRUNE_THRESHOLD, RESYNC_NOTIFY,
     RESYNC_NOTIFY_FLAP_FLOOR_SECONDS, RESYNC_NOTIFY_MIN_INTERVAL_SECONDS,
+    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
     _ResyncGate, handle_ping,
 )
 from chessshootout.server.protocol import (
@@ -891,11 +892,24 @@ async def _paired_in_progress_room(rooms, clock):
 
 
 async def _resync_room(app, clock):
+    """A room whose game has really been announced, with the clock parked past
+    the heartbeat transit grace. Both matter: an unannounced room refuses to
+    judge a heartbeat at all, and the game-start stamp excuses every ply until
+    the grace runs out."""
     room = await _paired_in_progress_room(app.state.rooms, clock)
     ws_w, ws_b = RecordingWS(), RecordingWS()
     app.state.connections.add(room.room_id, room.white.client_uuid, ws_w)
     app.state.connections.add(room.room_id, room.black.client_uuid, ws_b)
+    await broadcast_game_start(app.state.connections, room, clock)
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
     return room, ws_w, ws_b
+
+
+async def _lagging_spell(app, room, ws, color, ply=7):
+    """One lagging spell as the server now defines it: a mismatch that survives
+    RESYNC_STABLE_MISMATCH_HEARTBEATS judged heartbeats."""
+    for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS):
+        await handle_ping(app, ws, room, color, _ping_raw(ply))
 
 
 def _ping_raw(ply):
@@ -912,16 +926,18 @@ async def test_a_lagging_spell_after_a_recovery_notifies_the_opponent_again(app,
     starting inside that window was therefore silently unannounced — the opponent's
     strip read 'connected' while resync directives were still being pushed at the
     lagging client. Recovering now re-arms the gate down to the flap floor, so the
-    next real spell is announced."""
+    next real spell is announced. Each spell is now a PAIR of mismatching
+    heartbeats, because a single one is tolerated as a race."""
     room, ws_w, ws_b = await _resync_room(app, clock)
-    await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+    opened_at = clock()
+    await _lagging_spell(app, room, ws_w, "white")
     await handle_ping(app, ws_w, room, "white", _ping_raw(0))
     clock.advance(RESYNC_NOTIFY_FLAP_FLOOR_SECONDS + 0.1)
 
-    await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+    await _lagging_spell(app, room, ws_w, "white")
 
     assert _opp_states(ws_b) == ["resyncing", "connected", "resyncing"]
-    assert clock() < RESYNC_NOTIFY_MIN_INTERVAL_SECONDS, \
+    assert clock() - opened_at < RESYNC_NOTIFY_MIN_INTERVAL_SECONDS, \
         "and well inside the interval that used to swallow it"
 
 
@@ -929,11 +945,27 @@ async def test_a_ply_flap_inside_the_floor_still_notifies_only_once(app, clock):
     """The reason the gate exists at all: a client whose reported ply oscillates
     would otherwise toggle the opponent's connection strip at heartbeat rate. The
     re-arm above must not reopen that door — clearing only drops the wait to the
-    flap floor, and a same-instant flap never gets past it."""
+    flap floor, and a same-instant flap never gets past it. The flap is driven
+    in pairs so it clears the strike counter; a pure alternation never even
+    reaches the gate, which is asserted separately."""
+    room, ws_w, ws_b = await _resync_room(app, clock)
+    for _ in range(4):
+        await _lagging_spell(app, room, ws_w, "white")
+        await handle_ping(app, ws_w, room, "white", _ping_raw(0))
+    assert _opp_states(ws_b) == ["resyncing", "connected"]
+
+
+async def test_a_pure_ply_alternation_never_reaches_the_notify_gate(app, clock):
+    """The strike counter sits IN FRONT of the debounce, so the cheapest form of
+    the griefing pattern -- alternate a wrong ply with a right one at the socket
+    rate -- now costs the opponent nothing at all: every wrong ply is a first
+    strike and every right one wipes it."""
     room, ws_w, ws_b = await _resync_room(app, clock)
     for i in range(8):
         await handle_ping(app, ws_w, room, "white", _ping_raw(7 if i % 2 == 0 else 0))
-    assert _opp_states(ws_b) == ["resyncing", "connected"]
+
+    assert _opp_states(ws_b) == []
+    assert ws_w.of_type("resync_directive") == []
 
 
 def _fill_gate(gate, count, now, interval=RESYNC_NOTIFY_MIN_INTERVAL_SECONDS):

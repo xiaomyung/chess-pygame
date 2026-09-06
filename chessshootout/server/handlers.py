@@ -25,6 +25,7 @@ from chessshootout.server.protocol import (
     ArrowWire, ClockSnapshot, ConnectionStatusMessage,
     DrawOfferedMessage, DrawResponseMessage,
     ErrorMessage, GIVE_TIME_SECONDS, GIVE_TIME_TICK_MS, GiveTimeMessage,
+    HEARTBEAT_INTERVAL_SECONDS,
     MAX_SHARED_ARROWS, MAX_SHARED_HIGHLIGHTS, MODERATION_TRIP_LIMIT,
     MoveAppliedMessage, MoveMessage,
     PingMessage, PongMessage, QuickChatMessage, QuickChatReceivedMessage, Reason,
@@ -54,6 +55,23 @@ RESYNC_GATE_PRUNE_THRESHOLD = 512
 
 RESYNC_NOTIFY = "notify"
 RESYNC_DIRECTIVE = "directive"
+
+
+def _transit_grace(interval: float) -> float:
+    """
+    Work out how long a heartbeat may still describe the position as it was
+    just before the latest change. It has to cover a round trip plus a client
+    frame, and stay strictly under one heartbeat so at most one heartbeat per
+    change is ever forgiven
+
+    :param interval: seconds between heartbeats, as the server asks for them.
+    :returns: seconds a history change keeps excusing a stale heartbeat.
+    """
+    return min(1.5, interval * 0.75)
+
+
+RESYNC_TRANSIT_GRACE_SECONDS = _transit_grace(HEARTBEAT_INTERVAL_SECONDS)
+RESYNC_STABLE_MISMATCH_HEARTBEATS = 2
 
 IDLE_ACTIVITY_TYPES = frozenset({
     "move", "skill_check_shot", "draw_offer", "draw_response",
@@ -299,7 +317,7 @@ async def handle_move(app: FastAPI, websocket: WebSocket, room: Room, color: str
         to_sq = square_from_coord(msg.to_sq)
     except (ValidationError, ValueError):
         await send(connections.get_for_color(room, color),
-                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT))
+                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT, msg_type="move"))
         return "invalid_move_format"
     expected = room.color_to_move()
     if expected != color:
@@ -315,13 +333,13 @@ async def handle_move(app: FastAPI, websocket: WebSocket, room: Room, color: str
     facts = compute_facts(room.backend, from_sq, to_sq, room.skillcheck_locks)
     if facts is None:
         await send(connections.get_for_color(room, color),
-                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT))
+                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT, msg_type="move"))
         return "illegal"
     kind = online.select_kind(room.skillcheck_secret, room.plies_ever, room.backend,
                               from_sq, to_sq, room.skillcheck_locks, facts)
     if kind == SkillCheckKind.NONE:
         return await _apply_move(app, room, color, from_sq, to_sq, msg.promotion,
-                                 skill_kind=None, skill_won=None)
+                                 skill_kind=None, skill_won=None, answers="move")
     return await _arm_skillcheck(app, room, color, kind, from_sq, to_sq,
                                  msg.promotion, facts)
 
@@ -378,13 +396,16 @@ async def _arm_skillcheck(app: FastAPI, room: Room, color: str, kind: SkillCheck
 
 async def _apply_move(app: FastAPI, room: Room, color: str, from_sq: Square,
                       to_sq: Square, promotion: str | None,
-                      *, skill_kind: str | None, skill_won: bool | None) -> str:
+                      *, skill_kind: str | None, skill_won: bool | None,
+                      answers: str) -> str:
     """
     Land a move on the server's own board and tell both players -- the single
     place a ply actually becomes real. It advances the server-only ply counter
-    that seeds which move draws which check, clears the per-turn move locks
-    and both players' shared marks, records the skill check the move came
-    through, and ends the game right here when the position is final
+    that seeds which move draws which check, stamps the moment the history
+    grew so a heartbeat still in flight is not mistaken for a drifted board,
+    clears the per-turn move locks and both players' shared marks, records the
+    skill check the move came through, and ends the game right here when the
+    position is final
 
     :param app: the FastAPI application, source of the shared server state.
     :param room: the room the move belongs to.
@@ -395,19 +416,23 @@ async def _apply_move(app: FastAPI, room: Room, color: str, from_sq: Square,
         nothing and the pawn has reached the last rank.
     :param skill_kind: kind of check the move came through, None when none ran.
     :param skill_won: whether that check was won, None when none ran.
+    :param answers: message type a refusal is quoting back, so the client can
+        tell a rejected move from a rejected skill-check input.
     :returns: short outcome word, naming the result reason when the game ended.
     """
     rooms = app.state.rooms
     connections = app.state.connections
     backend = cast(Backend, room.backend)
+    prev_len = len(backend.move_history)
     result = backend.try_move(from_sq, to_sq)
     if not result.legal:
         await send(connections.get_for_color(room, color),
-                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT))
+                     ErrorMessage(reason=Reason.INVALID_MOVE_FORMAT, msg_type=answers))
         return "illegal"
     if result.promotion_required:
         backend.promote(to_sq, PROMO_TYPE_BY_LETTER[promotion or "q"])
     room.plies_ever += 1
+    room.note_history_change(app.state.now(), prev_len)
     room.mark_idle_activity(app.state.now() if room.idle_window() is not None else None)
     room.skillcheck_locks.clear()
     room.annotations_white.clear_marks()
@@ -543,7 +568,7 @@ async def handle_skill_check_shot(app: FastAPI, websocket: WebSocket, room: Room
                  pending.kind.value)
         return await _apply_move(app, room, color, pending.from_sq, pending.to_sq,
                                  pending.promotion, skill_kind=pending.kind.value,
-                                 skill_won=True)
+                                 skill_won=True, answers="skill_check_shot")
     if room.pending_skillcheck is not pending:
         return "noop"
     if hit:
@@ -836,7 +861,8 @@ async def handle_takeback_response(app: FastAPI, websocket: WebSocket, room: Roo
     Answer a takeback request: accepting rewinds the position on the server
     and sends the rewound state to both boards, declining just clears the
     request. An accepted takeback also drops the skill-check record for the
-    ply that was popped and restarts the idle countdown
+    ply that was popped, stamps the rewind so a heartbeat still in flight is
+    read as such, and restarts the idle countdown
 
     :param app: the FastAPI application, source of the shared server state.
     :param websocket: the socket the answer arrived on.
@@ -862,6 +888,7 @@ async def handle_takeback_response(app: FastAPI, websocket: WebSocket, room: Roo
         backend = cast(Backend, room.backend)
         popped_ply = len(backend.move_history)
         backend.undo()
+        room.note_history_change(app.state.now(), popped_ply)
         room.skillcheck_log = [e for e in room.skillcheck_log if e.ply < popped_ply]
         room.takeback_offered_by = None
         room.annotations_white.clear_marks()
@@ -936,19 +963,63 @@ async def _notify_opp_state(connections: ConnectionRegistry, room: Room, color: 
         await send(opp_ws, ConnectionStatusMessage(opp_state=state))
 
 
-async def set_resyncing(connections: ConnectionRegistry, room: Room, color: str) -> None:
+def _ply_in_transit(room: Room, ply: int, now: float) -> bool:
+    """
+    Judge whether a heartbeat reporting an out-of-date ply is simply describing
+    the position the client had before a very recent change, rather than a
+    board that has drifted. It is direction-aware for free: after a move only a
+    client one behind is excused, after a takeback only one ahead
+
+    :param room: the room the heartbeat belongs to.
+    :param ply: the ply the client says it is on.
+    :param now: monotonic seconds the heartbeat was handled at.
+    :returns: True while a recent change still explains that ply.
+    """
+    return any(
+        now - change.at < RESYNC_TRANSIT_GRACE_SECONDS
+        and (change.prev_len is None or ply == change.prev_len)
+        for change in room.history_changes
+    )
+
+
+def _newest_change_age(room: Room, now: float) -> float:
+    """
+    Measure how long ago this room's move history last changed, the age quoted
+    in the resync log line. Past the game-start gate a room always has at least
+    one stamp, and a room without one reads as an age of zero
+
+    :param room: the room whose history stamps are being read.
+    :param now: monotonic seconds to measure back from.
+    :returns: seconds since the newest stamp, 0.0 when there is none.
+    """
+    if not room.history_changes:
+        return 0.0
+    return max(now - room.history_changes[-1].at, 0.0)
+
+
+async def set_resyncing(connections: ConnectionRegistry, room: Room, color: str,
+                        *, client_ply: int, server_ply: int, age_s: float,
+                        streak: int) -> None:
     """
     Mark a player as rebuilding their game state and tell the opponent once,
     so the pause reads as a repair in progress. Repeat calls while the same
-    spell lasts do nothing
+    spell lasts do nothing, which is also what keeps the one operator line to
+    one per lagging spell rather than one per heartbeat
 
     :param connections: registry of live sockets for every room.
     :param room: the room the lagging player is in.
     :param color: the side that has fallen behind, white or black.
+    :param client_ply: the ply the client last reported.
+    :param server_ply: the ply the server's own board is on.
+    :param age_s: seconds since this room's history last changed.
+    :param streak: how many judged heartbeats have mismatched in a row.
     """
     slot = room.slot(color)
     if slot is not None and not slot.desync_active:
         slot.desync_active = True
+        log.info("resync directive room=%s color=%s client_ply=%d server_ply=%d "
+                 "age_s=%.2f streak=%d",
+                 room.room_id, color, client_ply, server_ply, age_s, streak)
         await _notify_opp_state(connections, room, color, "resyncing")
 
 
@@ -967,6 +1038,8 @@ async def clear_resyncing(app: FastAPI, room: Room, color: str) -> None:
     if slot is None or not slot.desync_active:
         return
     slot.desync_active = False
+    slot.ply_mismatch_streak = 0
+    log.info("resync cleared room=%s color=%s", room.room_id, color)
     _resync_gate(app).reopen((room.room_id, color, RESYNC_NOTIFY), app.state.now(),
                              RESYNC_NOTIFY_FLAP_FLOOR_SECONDS)
     await _notify_opp_state(app.state.connections, room, color, "connected")
@@ -976,10 +1049,13 @@ async def handle_ping(app: FastAPI, websocket: WebSocket, room: Room, color: str
                       raw: str) -> str:
     """
     Answer the client's heartbeat, and use the ply it reports to spot a board
-    that has drifted behind the server's. A lagging client is told to fetch
-    the whole state again and its opponent is told the pause is a resync --
-    both debounced, so a heartbeat every couple of seconds cannot turn into a
-    stream of repairs
+    that has genuinely drifted behind the server's. Everything that legitimately
+    puts the two out of step for a moment is forgiven first: a client not
+    sitting on a live online board reports no ply, a game not yet announced is
+    never judged, and a ply explained by a very recent move or takeback is read
+    as news still in flight. Only a mismatch that survives two judged
+    heartbeats earns a repair, and both the order to refetch and the note to
+    the opponent are debounced on top
 
     :param app: the FastAPI application, source of the shared server state.
     :param websocket: the socket the heartbeat arrived on.
@@ -998,20 +1074,36 @@ async def handle_ping(app: FastAPI, websocket: WebSocket, room: Room, color: str
         return "ping"
     if room.pending_skillcheck is not None:
         return "ping_pending"
-    if msg.ply == len(room.backend.move_history):
+    server_ply = len(room.backend.move_history)
+    slot = cast(PlayerSlot, room.slot(color))
+    if msg.ply == server_ply:
+        slot.ply_mismatch_streak = 0
         await clear_resyncing(app, room, color)
         return "ping"
-    gate = _resync_gate(app)
+    if not room.game_start_broadcast:
+        return "ping_pregame"
+    if msg.ply is None:
+        return "ping_offboard"
     now = app.state.now()
-    slot = room.slot(color)
-    if (slot is not None and not slot.desync_active
+    if _ply_in_transit(room, msg.ply, now):
+        return "ping_inflight"
+    slot.ply_mismatch_streak += 1
+    if slot.ply_mismatch_streak < RESYNC_STABLE_MISMATCH_HEARTBEATS:
+        return "ping_strike"
+    gate = _resync_gate(app)
+    if (not slot.desync_active
             and gate.allow((room.room_id, color, RESYNC_NOTIFY), now,
                            RESYNC_NOTIFY_MIN_INTERVAL_SECONDS)):
-        await set_resyncing(connections, room, color)
+        await set_resyncing(connections, room, color, client_ply=msg.ply,
+                            server_ply=server_ply,
+                            age_s=_newest_change_age(room, now),
+                            streak=slot.ply_mismatch_streak)
     if gate.allow((room.room_id, color, RESYNC_DIRECTIVE), now,
                   RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS):
-        await send(connections.get_for_color(room, color), ResyncDirectiveMessage())
-    return "ping"
+        await send(connections.get_for_color(room, color),
+                   ResyncDirectiveMessage(server_ply=server_ply))
+        return "ping_directed"
+    return "ping_gated"
 
 
 async def _relay_guard(websocket: WebSocket, room: Room, color: str, limiter: Any,

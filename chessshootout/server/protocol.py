@@ -915,11 +915,12 @@ class PingMessage(_Base):
     """
     The client's periodic heartbeat, which also reports the ply the client
     believes it is on, so a board that has fallen behind can be spotted and
-    repaired rather than drifting
+    repaired rather than drifting. A client that is not sitting on a live
+    online board reports no ply at all, and is judged on nothing
     """
 
     type: Literal["ping"] = "ping"
-    ply: int = 0
+    ply: int | None = Field(default=None, ge=0)
 
 
 class PongMessage(_Base):
@@ -934,10 +935,13 @@ class PongMessage(_Base):
 class ResyncDirectiveMessage(_Base):
     """
     Tells a client its board has fallen behind and it should fetch the whole
-    game state again instead of patching up what it has
+    game state again instead of patching up what it has. It carries the ply the
+    server was on when it decided, so a client that has since caught up on its
+    own can recognise the order as already answered and ignore it
     """
 
     type: Literal["resync_directive"] = "resync_directive"
+    server_ply: int
 
 
 class SkillCheckRequiredMessage(_SkillCheckGeometryBase, _Base):

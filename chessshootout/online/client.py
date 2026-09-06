@@ -401,13 +401,14 @@ class OnlineClient:
         """
         self._enqueue("send_give_time", hold_ms)
 
-    def send_ping(self, ply: int) -> None:
+    def send_ping(self, ply: int | None) -> None:
         """
         Send the heartbeat, stamping the moment so the reply can be turned into
         a round-trip reading. It also reports the ply this client is on, which
         is how a board that has fallen behind gets noticed
 
-        :param ply: number of half-moves this client has applied.
+        :param ply: number of half-moves this client has applied, or None while
+            it is not sitting on a live online board and has no ply to claim.
         """
         self._last_ping_sent_at = time.monotonic()
         self._enqueue("send_ping", ply)

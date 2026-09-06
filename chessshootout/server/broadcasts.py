@@ -134,11 +134,14 @@ async def broadcast_game_start(connections: ConnectionRegistry, room: Room,
     both names with their countries and series scores, the time control and
     their own color. The frames are built per player because the color differs,
     and each carries how long ago the game actually started so a client that
-    joined late does not run its clock from the wrong instant
+    joined late does not run its clock from the wrong instant. The moment is
+    stamped as a history change with no previous length, since what a client
+    was showing before a game start cannot be known
 
     :param connections: registry used to reach both players
     :param room: paired room whose game is starting
     :param now: monotonic seconds source, read for the elapsed-since-start value
+        and for the history-change stamp
     :param rematch: True when this game follows an accepted rematch offer
     """
     fen = export_fen(cast(Backend, room.backend))
@@ -163,6 +166,7 @@ async def broadcast_game_start(connections: ConnectionRegistry, room: Room,
             rematch=rematch,
         ))
         sent.append(color)
+    room.note_history_change(now(), None)
     room.game_start_broadcast = True
     log.info("game_start broadcast room=%s sent_to=%s elapsed=%.2f",
              room.room_id, sent, started_seconds_ago)

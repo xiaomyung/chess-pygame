@@ -620,6 +620,7 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         if (connections.get_for_color(room, cast(str, color)) is not None
                 and not slot.desync_active):
             slot.desync_active = True
+            slot.ply_mismatch_streak = 0
             opp_ws = connections.get_for_color(
                 room, room.opp_color(cast(str, color)))
             if opp_ws is not None:
