@@ -139,6 +139,7 @@ class Reason:
 
     VERSION_MISMATCH = "version_mismatch"
     INVALID_MESSAGE = "invalid_message"
+    INVALID_FIELD = "invalid_field"
     INVALID_MOVE_FORMAT = "invalid_move_format"
     NOT_YOUR_TURN = "not_your_turn"
     SKILLCHECK_PENDING = "skillcheck_pending"
@@ -237,6 +238,25 @@ class _Base(BaseModel):
     """
 
     version: int = PROTOCOL_VERSION
+
+
+class ReasonDetail(BaseModel):
+    """
+    Why a request was turned down, given as one code from the shared vocabulary
+    both the game and the server use, so the app can react to a refusal instead
+    of only showing it
+    """
+
+    reason: str
+
+
+class ReasonEnvelope(BaseModel):
+    """
+    The body sent back with a refused request: one detail object naming the
+    reason it was not accepted
+    """
+
+    detail: ReasonDetail
 
 
 class ClockSnapshot(BaseModel):

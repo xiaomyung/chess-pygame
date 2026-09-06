@@ -13,6 +13,7 @@ new lines drift off the format.
 """
 import ast
 import importlib
+import inspect
 import logging
 import logging.handlers
 import os
@@ -222,3 +223,55 @@ def test_every_server_module_that_logs_loudly_is_covered():
     assert uncovered == {}, f"add these modules to SERVER_LOG_MODULES: {sorted(uncovered)}"
     total = sum(len(_loud_templates(n)) for n in SERVER_LOG_MODULES)
     assert total >= 40, f"only {total} INFO/WARNING lines found, the scan is broken"
+
+
+def _get_logger_calls(path):
+    """Every `get_logger(...)` call node in one file, read off the AST."""
+    tree = ast.parse(read_source_without_docstrings(path), filename=path)
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name == "get_logger":
+            calls.append(node)
+    return calls
+
+
+def test_get_logger_takes_a_name_and_has_no_default():
+    """The default was `chess.server`, and nothing ever asked for it -- every
+    server module spells `chess.server.app` out. A default is a second logger name
+    waiting for the first caller who forgets: its lines would then miss every
+    caplog filter in the suite (and the operator's `journalctl` grep) while still
+    looking perfectly logged from the call site."""
+    params = list(inspect.signature(logging_setup.get_logger).parameters.values())
+    assert [p.name for p in params] == ["name"]
+    assert params[0].default is inspect.Parameter.empty
+
+
+def test_every_server_module_names_its_logger_with_a_literal():
+    """The one logger name for the whole server package, asserted at the call
+    sites rather than at the definition: a computed name (`__name__`, a variable,
+    an f-string) would still type-check and still log, but it would split the
+    package's output across several loggers and quietly break the caplog filters
+    the observability tests are built on."""
+    assert os.path.isdir(SERVER_ROOT), f"expected a walkable package dir at {SERVER_ROOT}"
+    scanned, names = 0, []
+    for root, _, files in os.walk(SERVER_ROOT):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            scanned += 1
+            for node in _get_logger_calls(path):
+                where = f"{os.path.relpath(path, PACKAGE_ROOT)}:{node.lineno}"
+                assert len(node.args) == 1 and not node.keywords, \
+                    f"{where}: get_logger takes exactly the logger name"
+                arg = node.args[0]
+                assert isinstance(arg, ast.Constant) and isinstance(arg.value, str), \
+                    f"{where}: the logger name must be a literal, not {ast.dump(arg)}"
+                names.append(arg.value)
+    assert scanned >= 8, f"only scanned {scanned} files, guard root is likely wrong"
+    assert names, "no get_logger call found at all, the scan is broken"
+    assert set(names) == {"chess.server.app"}, f"the server logger split: {sorted(set(names))}"

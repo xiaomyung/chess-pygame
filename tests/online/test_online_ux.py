@@ -28,6 +28,7 @@ from chessshootout.frontend.online_coordinator import (
     MATCH_FOUND_SECONDS, NOT_YOUR_TURN_TOASTS, ONLINE_HARD_FAILURE_LABELS,
     ONLINE_HARD_FAILURE_REASONS, ONLINE_TRANSIENT_REASON_LABELS,
 )
+from chessshootout.server.protocol import Reason
 
 
 _pygame_init = pygame_display(600, 400)
@@ -242,6 +243,9 @@ def test_match_found_transition_plays_online_game_start_sound(frontend):
         pytest.param("reconnect_failed",
                      ONLINE_HARD_FAILURE_LABELS["reconnect_failed"],
                      id="reconnect_failed_friendly_label"),
+        pytest.param(Reason.INVALID_FIELD,
+                     ONLINE_HARD_FAILURE_LABELS[Reason.INVALID_FIELD],
+                     id="invalid_field_friendly_label"),
         pytest.param("http_503", "Server unreachable",
                      id="http_prefixed_falls_back_to_generic"),
     ],
@@ -345,6 +349,24 @@ def test_not_your_turn_with_known_msg_type_shows_toast(frontend, msg_type):
 def test_hard_failure_set_is_well_formed():
     assert "server_unreachable" in ONLINE_HARD_FAILURE_REASONS
     assert "reconnect_failed" in ONLINE_HARD_FAILURE_REASONS
+
+
+def test_a_refused_request_tears_the_search_down_instead_of_spinning(frontend):
+    """A body the server refuses used to reach the client as the generic
+    `http_422`, which landed on this modal only by way of the `http_` prefix
+    fallback -- so it read "Server unreachable" for a server that answered
+    perfectly well. `invalid_field` is a first-class reason with its own label
+    now, and being a hard failure it still takes the wait card down: a refused
+    matchmake would otherwise leave the player watching a spinner for an opponent
+    the server never queued."""
+    frontend.coordinator.wait_modal.show("Rapid", "10 + 5", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error({"reason": Reason.INVALID_FIELD})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == "Request rejected by server"
+    assert not frontend.coordinator.wait_modal.is_visible()
+    assert frontend.toast.is_visible() is False
 
 
 def test_menu_mode_skips_board_draw(frontend, monkeypatch):

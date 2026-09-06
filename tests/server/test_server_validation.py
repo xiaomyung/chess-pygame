@@ -104,34 +104,82 @@ def client(clock):
 
 
 @pytest.mark.parametrize(
-    "method, route, payload, expected_status",
+    "method, route, payload, field",
     [
         pytest.param(
             "POST", "/matchmake",
             {"version": PROTOCOL_VERSION, "client_uuid": "alice",
              "nickname": "Alice", "time_minutes": 5, "increment_seconds": 0},
-            422, id="matchmake_garbage_client_uuid",
+            "client_uuid", id="matchmake_garbage_client_uuid",
         ),
         pytest.param(
             "POST", "/resume",
             {"version": PROTOCOL_VERSION, "room_id": "not-a-uuid", "session_token": "x"},
-            422, id="resume_garbage_room_id",
+            "room_id", id="resume_garbage_room_id",
         ),
         pytest.param(
             "POST", "/reclaim",
             {"version": PROTOCOL_VERSION, "client_uuid": "u1"},
-            422, id="reclaim_garbage_client_uuid",
+            "client_uuid", id="reclaim_garbage_client_uuid",
         ),
         pytest.param(
             "DELETE", "/matchmake",
             {"version": PROTOCOL_VERSION, "room_id": "blah", "session_token": "t"},
-            422, id="cancel_matchmake_garbage_room_id",
+            "room_id", id="cancel_matchmake_garbage_room_id",
         ),
     ],
 )
-def test_route_rejects_non_uuid4_payload(client, method, route, payload, expected_status):
-    r = client.request(method, route, json=payload)
-    assert r.status_code == expected_status
+def test_route_rejects_non_uuid4_payload(client, caplog, method, route, payload, field):
+    """All four body routes answer a refused body with the same closed envelope --
+    one shared reason code, no field list, no pydantic prose. The list shape they
+    used to return was FastAPI's own default: unstable across versions, and it put
+    the failure's raw text (and, in `input`, the rejected value itself) into a
+    reply anybody can trigger. Which field failed now goes to the operator's log
+    instead, which is what the caplog half asserts."""
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        r = client.request(method, route, json=payload)
+    assert r.status_code == 422
+    assert r.json() == {"detail": {"reason": Reason.INVALID_FIELD}}
+    rejected = [rec.getMessage() for rec in caplog.records
+                if rec.getMessage().startswith("request rejected")]
+    assert rejected == [f"request rejected path={route} field=body.{field} "
+                        f"error=value_error"]
+
+
+def test_the_published_422_matches_the_shape_the_routes_actually_send(client):
+    """/openapi.json is the contract a stranger generates a client from, and it
+    used to document FastAPI's HTTPValidationError list for a 422 the server never
+    sends. Every body route now publishes the envelope it really answers with."""
+    spec = client.get("/openapi.json").json()
+    body_routes = [("/matchmake", "post"), ("/matchmake", "delete"),
+                   ("/resume", "post"), ("/reclaim", "post")]
+    for path, method in body_routes:
+        schema = spec["paths"][path][method]["responses"]["422"]["content"]
+        ref = schema["application/json"]["schema"]["$ref"]
+        assert ref.endswith("/ReasonEnvelope"), f"{method.upper()} {path} publishes {ref}"
+    envelope = spec["components"]["schemas"]["ReasonEnvelope"]
+    assert envelope["properties"]["detail"]["$ref"].endswith("/ReasonDetail")
+    assert spec["components"]["schemas"]["ReasonDetail"]["properties"]["reason"][
+        "type"] == "string"
+
+
+def test_a_route_raised_validation_error_is_a_server_error_not_a_422(clock):
+    """The deleted `_validation_handler` caught pydantic's own ValidationError
+    app-wide. It never fired for request bodies -- FastAPI raises
+    RequestValidationError for those -- but it WOULD have dressed a server-side
+    modelling bug up as the caller's fault, with a 422 and a leaked pydantic
+    message. Uncaught, such a bug is what it actually is: a 500."""
+    app = create_app(now_provider=clock, max_rooms=8)
+
+    @app.get("/raises-a-model-error")
+    async def raises_a_model_error():
+        ResumeRequest(room_id="not-a-uuid", session_token="t")
+        return {"unreachable": True}
+
+    quiet = TestClient(app, raise_server_exceptions=False)
+    r = quiet.get("/raises-a-model-error")
+    assert r.status_code == 500
+    assert Reason.INVALID_FIELD not in r.text
 
 
 def test_ws_closes_with_invalid_token_on_garbage_room_id_path(client):

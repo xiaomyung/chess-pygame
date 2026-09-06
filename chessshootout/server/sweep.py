@@ -122,8 +122,6 @@ class Sweep:
                 game_result = backend.game_result()
                 if game_result in RESULT_REASON_BY_GAME_RESULT:
                     reason, winner = RESULT_REASON_BY_GAME_RESULT[game_result]
-                    log.info("game over room=%s reason=%s winner=%s",
-                             room.room_id, reason, winner)
                     await finalize_and_broadcast(self.rooms, self.connections, room,
                                                  reason, winner_color=winner)
             if room.result is not None:
@@ -148,8 +146,6 @@ class Sweep:
             winner_slot = room.slot(winner)
             if winner_slot is None or winner_slot.disconnected_at is not None:
                 return
-        log.info("idle timeout room=%s reason=%s winner=%s plies=%d",
-                 room.room_id, reason, winner, room.plies_ever)
         await finalize_and_broadcast(self.rooms, self.connections, room, reason,
                                      winner_color=winner)
 
@@ -170,8 +166,8 @@ class Sweep:
             if self._now() - slot.disconnected_at < GRACE_SECONDS:
                 continue
             winner = room.opp_color(gone_color)
-            log.info("abandonment room=%s loser=%s winner=%s desync=%s",
-                     room.room_id, gone_color, winner, slot.desync_active)
+            log.info("grace expired room=%s loser=%s desync=%s",
+                     room.room_id, gone_color, slot.desync_active)
             await finalize_and_broadcast(self.rooms, self.connections, room,
                                          Reason.ABANDONMENT, winner_color=winner)
 

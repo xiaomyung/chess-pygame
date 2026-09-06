@@ -58,6 +58,7 @@ ONLINE_HARD_FAILURE_LABELS = {
     ClientReason.SERVER_UNREACHABLE: "Server unreachable",
     ClientReason.RECONNECT_FAILED: "Could not reconnect",
     Reason.ROOM_FULL: "Server is full",
+    Reason.INVALID_FIELD: "Request rejected by server",
 }
 
 ONLINE_HARD_FAILURE_REASONS = frozenset(ONLINE_HARD_FAILURE_LABELS)

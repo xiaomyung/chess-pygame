@@ -13,7 +13,7 @@ from slowapi import Limiter
 from chessshootout.server.app import (
     MATCHMAKE_PER_IP_LIMIT, MAX_INBOUND_MESSAGE_BYTES, PROTOCOL_VERSION,
     UuidRateLimiter, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
-    WS_CLOSE_SUPERSEDED, create_app,
+    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED, create_app,
 )
 from chessshootout.server.broadcasts import idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
@@ -157,55 +157,77 @@ def test_matchmake_returns_room_and_token(client):
 
 
 @pytest.mark.parametrize(
-    "body",
+    "body, field",
     [
         pytest.param(
             {"version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
              "time_minutes": 0, "increment_seconds": 0, "side_preference": "random"},
-            id="zero_time_minutes",
+            "time_minutes", id="zero_time_minutes",
         ),
         pytest.param(
             {"version": PROTOCOL_VERSION, "client_uuid": ZED, "nickname": "Z",
              "time_minutes": 5, "increment_seconds": -1},
-            id="negative_increment",
+            "increment_seconds", id="negative_increment",
         ),
         pytest.param(
             {"version": PROTOCOL_VERSION, "client_uuid": ZED,
              "nickname": "", "time_minutes": 5, "increment_seconds": 0},
-            id="empty_nickname",
+            "nickname", id="empty_nickname",
         ),
         pytest.param(
             {"version": PROTOCOL_VERSION, "client_uuid": ZED, "nickname": "Z",
              "time_minutes": MAX_TIME_MINUTES + 1, "increment_seconds": 0},
-            id="time_minutes_over_cap",
+            "time_minutes", id="time_minutes_over_cap",
         ),
         pytest.param(
             {"version": PROTOCOL_VERSION, "client_uuid": ZED, "nickname": "Z",
              "time_minutes": 5, "increment_seconds": MAX_INCREMENT_SECONDS + 1},
-            id="increment_over_cap",
+            "increment_seconds", id="increment_over_cap",
         ),
     ],
 )
-def test_matchmake_rejects_invalid_field(client, body):
+def test_matchmake_rejects_invalid_field(client, caplog, body, field):
     """Each invalid matchmake field is rejected with 422 before any room is created.
 
     The two over-cap cases are the SECURITY half: an unbounded time control mints
     a fresh never-pairing queue bucket per distinct pair, so the rejection has to
     land before enqueue touches `_queue`.
 
-    The body assertion pins WHERE the rejection happens: pydantic's field-error
-    list means MatchmakeRequest's own Field bounds refused the request and the
-    endpoint body never ran. The endpoint used to re-check the time control by hand
-    and answer `{"reason": "invalid_time_control"}` instead -- dead code, since the
-    model's bounds are strictly tighter than that check, and this is the assertion
-    that fails if such a shadowing hand check ever comes back."""
-    r = client.post("/matchmake", json=body)
+    The 422 body is the closed reason envelope both sides share, so WHERE the
+    rejection happened can no longer be read off the response -- the caplog
+    assertion carries that instead: `field=body.<name>` proves MatchmakeRequest's
+    own bounds refused the request at the model boundary and the endpoint body
+    never ran. The endpoint used to re-check the time control by hand and answer
+    `{"reason": "invalid_time_control"}` -- dead code, since the model's bounds are
+    strictly tighter, and this is the assertion that fails if such a shadowing hand
+    check ever comes back."""
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        r = client.post("/matchmake", json=body)
     assert r.status_code == 422
-    detail = r.json()["detail"]
-    assert isinstance(detail, list) and detail, "the pydantic field-error list, not a reason"
-    assert all("loc" in err and "type" in err for err in detail)
+    assert r.json() == {"detail": {"reason": Reason.INVALID_FIELD}}
+    rejected = [rec.getMessage() for rec in caplog.records
+                if rec.getMessage().startswith("request rejected")]
+    assert len(rejected) == 1, f"one WARNING per refused body, got {rejected}"
+    assert "path=/matchmake" in rejected[0]
+    assert f"field=body.{field}" in rejected[0]
     assert client.get("/healthz").json()["rooms_active"] == 0
     assert client.get("/healthz").json()["queue_depth"] == 0
+
+
+def test_the_rejection_warning_never_carries_the_rejected_value(client, caplog):
+    """The refused body is attacker-controlled, so the WARNING names the field and
+    the error kind and stops there. Logging the value would put arbitrary text --
+    newlines included -- into the operator's journal through a public endpoint."""
+    leaky = "leak-me-9a7f3c"
+    with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
+        r = client.post("/matchmake", json={
+            "version": PROTOCOL_VERSION, "client_uuid": leaky, "nickname": "Z",
+            "time_minutes": 5, "increment_seconds": 0,
+        })
+    assert r.status_code == 422
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("field=body.client_uuid" in m for m in messages)
+    assert not any(leaky in m for m in messages), "the rejected value must not be logged"
 
 
 def test_matchmake_model_bounds_subsume_the_removed_hand_checked_floor():
@@ -290,6 +312,81 @@ async def test_abandoned_queue_flood_stops_locking_the_server_out(app, client, c
     assert client.get("/healthz").json()["queue_depth"] == 0
     assert app.state.rooms._queue == {}, "emptied time-control buckets go too"
     assert _matchmake(client, uuid=ZED, nickname="Z", time=100).status_code == 200
+
+
+def test_matchmake_refused_at_capacity_logs_the_load_that_caused_it(app, client, caplog):
+    """The refusal is an operator's first sign that a box is at its cap, and
+    `matchmake rejected reason=server_full` said only that it happened -- not
+    whether the rooms were games or waiters, which is the difference between
+    "raise MAX_ROOMS" and "the queue is leaking". The `reason=` value is the code
+    the caller is actually answered with (503 room_full); the old line named an
+    internal string that appeared nowhere on the wire.
+
+    The fill is the same distinct-uuid/distinct-time shape as the reap test above,
+    so nothing pairs and the whole cap is queue depth."""
+    max_rooms = app.state.rooms._max_rooms
+    for i in range(max_rooms):
+        assert _matchmake(client, uuid=fake_uuid4(200 + i), nickname=f"N{i}",
+                          time=i + 1).status_code == 200
+
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        blocked = _matchmake(client, uuid=ZED, nickname="Z", time=100)
+
+    assert blocked.status_code == 503
+    assert blocked.json()["detail"]["reason"] == Reason.ROOM_FULL
+    refusals = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("matchmake rejected")]
+    assert refusals == [
+        f"matchmake rejected reason={Reason.ROOM_FULL} rooms_active=0 "
+        f"queue_depth={max_rooms} max_rooms={max_rooms}"
+    ]
+
+
+class _ClosingProbeWS(RecordingWS):
+    """A filed socket that notes whether the shutdown line was already in the
+    journal by the time the server got round to closing it."""
+
+    def __init__(self, caplog):
+        super().__init__()
+        self._caplog = caplog
+        self.line_logged_first = None
+
+    async def close(self, code=1000):
+        self.line_logged_first = any(
+            rec.getMessage().startswith("gameserver shutting down")
+            for rec in self._caplog.records)
+        await super().close(code)
+
+
+def test_shutdown_logs_the_load_it_was_carrying(app, caplog):
+    """A stopped process used to leave no trace at all, so a clean stop and a
+    crash read identically in the journal.
+
+    The line is the FIRST statement of the lifespan's `finally`, so its numbers
+    describe what was torn down rather than the empty server left behind -- the
+    probe sockets assert that ordering directly, since they are told the server
+    is going down only after the line is written. The fake clock is never
+    advanced inside the block, so uptime_s pins the arithmetic exactly."""
+    sockets = [_ClosingProbeWS(caplog), _ClosingProbeWS(caplog)]
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        with TestClient(app) as live:
+            r1 = _matchmake(live, uuid=ALICE, nickname="A")
+            r2 = _matchmake(live, uuid=BOB, nickname="B")
+            assert r2.json()["room_id"] == r1.json()["room_id"]
+            room = app.state.rooms.get(r1.json()["room_id"])
+            for slot, ws in zip((room.white, room.black), sockets):
+                app.state.connections.add(room.room_id, slot.client_uuid, ws)
+
+    lines = [rec.getMessage() for rec in caplog.records
+             if rec.getMessage().startswith("gameserver shutting down")]
+    assert lines == ["gameserver shutting down uptime_s=0.0 rooms_active=1 "
+                     "queue_depth=0 sockets=2"]
+    assert not [rec for rec in caplog.records
+                if rec.getMessage().startswith("game finalized")], \
+        "a shutdown ends the process, not the game -- no room's result is written"
+    for ws in sockets:
+        assert ws.closed_with == WS_CLOSE_SERVER_SHUTDOWN
+        assert ws.line_logged_first is True, "the line must precede the teardown"
 
 
 def test_cancel_matchmake_is_rate_limited_per_ip(client):

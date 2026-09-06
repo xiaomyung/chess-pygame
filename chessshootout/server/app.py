@@ -9,6 +9,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 from slowapi import Limiter
@@ -33,13 +34,14 @@ from chessshootout.server.protocol import (
     ConnectionStatusMessage, ErrorMessage,
     HealthResponse, HistoryEntryWire, LockWire,
     MatchmakeRequest, MatchmakeResponse,
-    PROTOCOL_VERSION, PendingSkillCheckWire, Reason, ReclaimRequest, ReclaimResponse,
-    RematchRequestMessage, RematchUpdateMessage,
+    PROTOCOL_VERSION, PendingSkillCheckWire, Reason, ReasonEnvelope, ReclaimRequest,
+    ReclaimResponse, RematchRequestMessage, RematchUpdateMessage,
     ResultMessage, ResumeRequest, ResumeResponse, SkillCheckOutcomeWire, is_uuid4,
 )
 from chessshootout.server.rooms import (
-    AlreadyInGameError, InvalidTokenError, NotInRoomError, PAIRING_WAIT_SECONDS,
-    PlayerSlot, Room, RoomManager, SharedAnnotations,
+    AlreadyInGameError, GameAlreadyStartedError, InvalidTokenError, NotInRoomError,
+    PAIRING_WAIT_SECONDS, PlayerSlot, Room, RoomManager, ServerFullError,
+    SharedAnnotations,
 )
 from chessshootout.server.sweep import Sweep
 
@@ -320,9 +322,10 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         """
         Run the server's startup and shutdown around the serving period: note
         the build and the trusted proxy set in the log, keep the background
-        sweep alive for as long as the process serves, and on the way out tell
-        everyone still connected that the server is going down before their
-        sockets are closed, so nobody is left staring at a dead board
+        sweep alive for as long as the process serves, and on the way out
+        record what was still going on before telling everyone still connected
+        that the server is going down and closing their sockets, so nobody is
+        left staring at a dead board
 
         :param app: application being started, carrying the shared state
         :returns: a context that stays open for the server's whole lifetime
@@ -334,6 +337,10 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         try:
             yield
         finally:
+            log.info("gameserver shutting down uptime_s=%.1f rooms_active=%d "
+                     "queue_depth=%d sockets=%d",
+                     now_provider() - started_at, rooms.rooms_active,
+                     rooms.queue_depth, sum(1 for _ in connections.all_active()))
             sweep_task.cancel()
             shutdown_msg = ResultMessage(reason=Reason.SERVER_SHUTDOWN)
             for _, ws in list(connections.all_active()):
@@ -375,18 +382,29 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             content={"detail": {"reason": Reason.RATE_LIMITED}},
         )
 
-    @app.exception_handler(ValidationError)
-    async def _validation_handler(request: Request, exc: ValidationError) -> JSONResponse:
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(
+        request: Request, exc: RequestValidationError,
+    ) -> JSONResponse:
         """
-        Turn a request body that failed validation into a single reason code the
-        client can act on, rather than a wall of field errors. Only the first
-        failure is reported, because the client shows one message
+        Turn a request body the server could not read into the single reason
+        code the client acts on, rather than a wall of field errors. The refusal
+        is recorded with the endpoint and the field that failed, never with what
+        was sent, so a rejected value cannot be written into the log this way
 
-        :param request: the rejected request, not read here
-        :param exc: validation error raised while parsing the body
-        :returns: a 422 response carrying the first failure's reason
+        :param request: the rejected request, read for the path it was sent to
+        :param exc: the failure raised while validating the request body
+        :returns: a 422 response carrying the invalid-field reason
         """
-        return JSONResponse(status_code=422, content={"reason": _first_validation_reason(exc)})
+        errors = exc.errors()
+        first: dict[str, Any] = dict(errors[0]) if errors else {}
+        field = ".".join(str(part) for part in first.get("loc", ())) or "body"
+        log.warning("request rejected path=%s field=%s error=%s",
+                    request.url.path, field, first.get("type", "unknown"))
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"reason": Reason.INVALID_FIELD}},
+        )
 
     @app.get("/")
     async def root() -> dict[str, Any]:
@@ -431,7 +449,8 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             uptime_s=now_provider() - app.state.started_at,
         )
 
-    @app.post("/matchmake", response_model=MatchmakeResponse)
+    @app.post("/matchmake", response_model=MatchmakeResponse,
+              responses={422: {"model": ReasonEnvelope}})
     @limiter.limit(MATCHMAKE_PER_IP_LIMIT)
     async def post_matchmake(request: Request, body: MatchmakeRequest) -> MatchmakeResponse:
         """
@@ -483,11 +502,11 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
         except AlreadyInGameError:
             log.info("matchmake rejected uuid=%s reason=already_in_game", body.client_uuid[:8])
             raise HTTPException(status_code=409, detail={"reason": Reason.ALREADY_IN_GAME})
-        except RuntimeError as exc:
-            if str(exc) == "server_full":
-                log.warning("matchmake rejected reason=server_full")
-                raise HTTPException(status_code=503, detail={"reason": Reason.ROOM_FULL})
-            raise
+        except ServerFullError:
+            log.warning("matchmake rejected reason=%s rooms_active=%d queue_depth=%d "
+                        "max_rooms=%d", Reason.ROOM_FULL, rooms.rooms_active,
+                        rooms.queue_depth, max_rooms)
+            raise HTTPException(status_code=503, detail={"reason": Reason.ROOM_FULL})
         if room.is_paired():
             log.info("room paired room=%s white=%s black=%s", room.room_id,
                      cast(PlayerSlot, room.white).client_uuid[:8],
@@ -496,7 +515,7 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             log.info("room created room=%s uuid=%s", room.room_id, body.client_uuid[:8])
         return MatchmakeResponse(room_id=room.room_id, session_token=token)
 
-    @app.delete("/matchmake")
+    @app.delete("/matchmake", responses={422: {"model": ReasonEnvelope}})
     @limiter.limit(MATCHMAKE_PER_IP_LIMIT)
     async def delete_matchmake(request: Request,
                                body: CancelMatchmakeRequest) -> dict[str, str]:
@@ -516,15 +535,14 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             raise HTTPException(status_code=404, detail={"reason": Reason.NOT_IN_ROOM})
         except InvalidTokenError:
             raise HTTPException(status_code=401, detail={"reason": Reason.SESSION_EXPIRED})
-        except RuntimeError as exc:
-            if str(exc) == "game_already_started":
-                log.info("cancel ignored room=%s reason=game_already_started", body.room_id)
-                return {"status": "already_started"}
-            raise
+        except GameAlreadyStartedError:
+            log.info("cancel ignored room=%s reason=game_already_started", body.room_id)
+            return {"status": "already_started"}
         log.info("cancel ok room=%s", body.room_id)
         return {"status": "ok"}
 
-    @app.post("/resume", response_model=ResumeResponse)
+    @app.post("/resume", response_model=ResumeResponse,
+              responses={422: {"model": ReasonEnvelope}})
     @limiter.limit(RESUME_PER_IP_LIMIT)
     async def post_resume(request: Request, body: ResumeRequest) -> ResumeResponse:
         """
@@ -608,7 +626,8 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
                 await send(opp_ws, ConnectionStatusMessage(opp_state="resyncing"))
         return response
 
-    @app.post("/reclaim", response_model=ReclaimResponse)
+    @app.post("/reclaim", response_model=ReclaimResponse,
+              responses={422: {"model": ReasonEnvelope}})
     @limiter.limit(RECLAIM_PER_IP_LIMIT)
     async def post_reclaim(request: Request, body: ReclaimRequest) -> ReclaimResponse:
         """
@@ -677,22 +696,6 @@ async def _sweep_loop(app: FastAPI) -> None:
             await app.state.sweep.step_all()
     except asyncio.CancelledError:
         pass
-
-
-def _first_validation_reason(exc: ValidationError) -> str:
-    """
-    Boil a validation failure down to the single reason string the client is
-    told. The reason codes are a closed vocabulary shared by both sides, so a
-    failure with nothing usable in it falls back to the generic one rather than
-    inventing wording
-
-    :param exc: validation error raised while parsing a request body
-    :returns: the first failure's message, or the generic invalid-message code
-    """
-    errs = exc.errors()
-    if not errs:
-        return Reason.INVALID_MESSAGE
-    return errs[0].get("msg", Reason.INVALID_MESSAGE)
 
 
 def _over_inbound_cap(raw: str) -> bool:
@@ -885,9 +888,9 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
                 log.debug("ws recv on superseded/closed socket room=%s color=%s: %s",
                           room.room_id, color, exc)
                 break
-            except Exception as exc:
-                log.warning("ws recv unexpected exc room=%s color=%s exc=%r",
-                            room.room_id, color, exc)
+            except Exception:
+                log.exception("ws recv failed room=%s color=%s",
+                              room.room_id, room.color_of(auth_uuid) or color)
                 break
             if _over_inbound_cap(raw):
                 await websocket.close(code=WS_CLOSE_PAYLOAD_TOO_LARGE)

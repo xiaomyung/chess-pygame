@@ -585,7 +585,6 @@ async def handle_resign(app: FastAPI, websocket: WebSocket, room: Room, color: s
     if room.result is not None:
         return "already_over"
     winner = room.opp_color(color)
-    log.info("resign room=%s loser=%s winner=%s", room.room_id, color, winner)
     await finalize_and_broadcast(rooms, connections, room, Reason.RESIGNATION,
                                  winner_color=winner)
     return "resigned"
@@ -610,7 +609,7 @@ async def handle_draw_offer(app: FastAPI, websocket: WebSocket, room: Room, colo
     if room.result is not None or room.backend is None:
         return "noop"
     if room.draw_offered_by is not None and room.draw_offered_by != color:
-        log.info("draw mutual room=%s", room.room_id)
+        log.info("draw accepted room=%s by=%s", room.room_id, color)
         room.draw_offered_by = None
         await finalize_and_broadcast(rooms, connections, room, Reason.DRAW_AGREEMENT)
         return "agreed"

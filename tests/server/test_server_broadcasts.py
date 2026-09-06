@@ -9,6 +9,7 @@ place a result is written, and the AST guard at the bottom is what keeps it
 that way.
 """
 import ast
+import logging
 import os
 
 import pytest
@@ -201,3 +202,104 @@ def test_finalize_result_is_called_from_broadcasts_and_nowhere_else():
         f"finalize_result must be called only from broadcasts.py, found {callers}"
     assert len(callers[FINALIZE_CALLER]) == 1, \
         f"and exactly once inside it, found {callers[FINALIZE_CALLER]}"
+
+
+FINALIZE_PREFIX = "game finalized"
+
+
+def _finalize_lines(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith(FINALIZE_PREFIX)]
+
+
+@pytest.mark.asyncio
+async def test_one_game_finalized_line_per_game_however_often_finalize_is_called(
+    app, clock, caplog,
+):
+    """The funnel line sits INSIDE the `applied` guard, so it inherits the
+    once-per-game property from the result itself. Outside the guard, every
+    late resign, sweep tick or reconnect racing an already-ended game would
+    file a fresh ending in the journal."""
+    rooms = app.state.rooms
+    room = await _pair(rooms)
+    room.first_move_at = clock()
+    room.plies_ever = 3
+    connections = app.state.connections
+    connections.add(room.room_id, room.white.client_uuid, RecordingWS())
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        for _ in range(3):
+            await finalize_and_broadcast(rooms, connections, room,
+                                         Reason.RESIGNATION, winner_color="black")
+
+    assert _finalize_lines(caplog) == [
+        f"game finalized room={room.room_id} reason={Reason.RESIGNATION} "
+        f"winner=black plies=3 duration_s=0.0"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_finalize_that_loses_the_race_logs_nothing(app, clock, caplog):
+    """Same race as the double-broadcast test above, read from the journal: the
+    contradictory reason the losing caller carried must not reach the log any
+    more than it reaches the players."""
+    rooms = app.state.rooms
+    connections = app.state.connections
+    room = await _pair(rooms)
+    room.first_move_at = clock()
+    room.plies_ever = 5
+    connections.add(room.room_id, room.white.client_uuid,
+                    _RacingWS(rooms, connections, room))
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        await finalize_and_broadcast(rooms, connections, room,
+                                     Reason.RESIGNATION, winner_color="black")
+
+    lines = _finalize_lines(caplog)
+    assert len(lines) == 1
+    assert Reason.CHECKMATE not in lines[0], "the losing reason must not be logged"
+
+
+@pytest.mark.asyncio
+async def test_finalizing_a_room_that_never_started_logs_nothing(app, caplog):
+    """A room still waiting in the queue is not in `_active`, so finalize_result
+    refuses it. Nothing happened to that game, so nothing is reported -- and the
+    line's `duration_s` may never be computed off the None `started_at` such a
+    room could carry."""
+    rooms = app.state.rooms
+    room = await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
+                               time_minutes=5, increment_seconds=0,
+                               side_preference="white")
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        await finalize_and_broadcast(rooms, app.state.connections, room,
+                                     Reason.ABANDONMENT, winner_color="black")
+
+    assert room.result is None
+    assert _finalize_lines(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_a_zero_ply_abort_logs_the_rewritten_reason_and_the_wait(
+    app, clock, caplog,
+):
+    """`plies` and `reason` come from the STORED result, not from the arguments:
+    an abandonment with no ply played is recorded as an abort, and the line has
+    to say abort too -- that is the difference between "somebody walked out of a
+    game" and "a pairing never got going", which is what an operator reads the
+    field for. duration_s counts from pairing, so it is the whole wait."""
+    rooms = app.state.rooms
+    room = await _pair(rooms)
+    connections = app.state.connections
+    connections.add(room.room_id, room.white.client_uuid, RecordingWS())
+    clock.advance(45.25)
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        await finalize_and_broadcast(rooms, connections, room,
+                                     Reason.ABANDONMENT, winner_color="black")
+
+    assert room.result == (Reason.ABORTED, None)
+    assert _finalize_lines(caplog) == [
+        f"game finalized room={room.room_id} reason={Reason.ABORTED} winner=none "
+        f"plies=0 duration_s=45.2"
+    ]

@@ -55,6 +55,26 @@ class InvalidTokenError(Exception):
     pass
 
 
+class ServerFullError(Exception):
+    """
+    Raised when the server already holds as many games and waiting players as
+    it will take, which the matchmaking route turns into a refusal asking the
+    player to try again shortly
+    """
+
+    pass
+
+
+class GameAlreadyStartedError(Exception):
+    """
+    Raised when a player tries to withdraw from a waiting place whose game has
+    meanwhile begun, which the cancel route reports as already started rather
+    than as a failure
+    """
+
+    pass
+
+
 @dataclass
 class PlayerSlot:
     """
@@ -507,7 +527,7 @@ class RoomManager:
             if client_uuid in self._uuid_to_room:
                 raise AlreadyInGameError()
             if len(self._active) + self.queue_depth >= self._max_rooms:
-                raise RuntimeError("server_full")
+                raise ServerFullError()
             tc = (time_minutes, increment_seconds)
             queue = self._queue[tc]
             if queue:
@@ -610,7 +630,7 @@ class RoomManager:
             room = self._find_in_queue(room_id)
             if room is None:
                 if room_id in self._active:
-                    raise RuntimeError("game_already_started")
+                    raise GameAlreadyStartedError()
                 raise NotInRoomError()
             slot = room.white or room.black
             if slot is None or slot.session_token != session_token:

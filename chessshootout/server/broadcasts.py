@@ -27,7 +27,9 @@ async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegi
     End a game once and tell both players how it ended. The room decides whether
     this attempt is the one that lands, and a concurrent caller that lost the
     race broadcasts nothing; the frame that does go out is built from the stored
-    result, so both players are always told the same outcome
+    result, so both players are always told the same outcome. Every game that
+    ends passes through here, so this is also where the one line describing the
+    ending is logged, whose duration is seconds since pairing
 
     :param rooms: room manager that records the result
     :param connections: registry used to reach both players
@@ -39,6 +41,9 @@ async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegi
     if not applied:
         return
     result_reason, result_winner = cast(tuple[str, str | None], room.result)
+    log.info("game finalized room=%s reason=%s winner=%s plies=%d duration_s=%.1f",
+             room.room_id, result_reason, result_winner or "none", room.plies_ever,
+             cast(float, room.ended_at) - cast(float, room.started_at))
     await broadcast(rooms, connections, room,
                     ResultMessage(reason=result_reason, winner_color=result_winner))
 
