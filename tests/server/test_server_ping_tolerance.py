@@ -108,10 +108,13 @@ def _directives(ws):
 
 async def _strike_up_to_directive(app, clock, room, ws, color, ply):
     """Land exactly the strikes the constant allows before a directive, so a
-    test that wants the directive itself only has to send one more ping."""
+    test that wants the directive itself only has to send one more ping. The
+    count is against whatever this socket has already been sent, because a
+    directive spends the streak and a client can earn a second one."""
+    before = len(_directives(ws))
     for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS - 1):
         assert await handle_ping(app, ws, room, color, _ping_raw(ply)) == "ping_strike"
-    assert _directives(ws) == []
+    assert len(_directives(ws)) == before
 
 
 async def test_a_heartbeat_one_ply_behind_a_fresh_move_is_news_in_flight(app, clock):
@@ -351,11 +354,14 @@ async def test_a_fresh_socket_clears_the_strike_streak(app, clock):
 async def test_a_second_directive_is_held_inside_the_directive_interval(app, clock):
     """Each directive drives a /resume, so the debounce is what stops a client
     that keeps mismatching from amplifying itself against the state-rebuild
-    path. The strike counter sits in front of it, never instead of it."""
+    path. The strike counter sits in front of it, never instead of it: a client
+    that ignores an order pays for the next one in strikes first, and the
+    interval still holds that one back when both land inside the same second."""
     room, ws_w, ws_b = await _live_room(app, clock)
     await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
     assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_directed"
 
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
     out = await handle_ping(app, ws_w, room, "white", _ping_raw(7))
 
     assert out == "ping_gated"
@@ -366,12 +372,33 @@ async def test_a_second_directive_is_held_inside_the_directive_interval(app, clo
     assert len(_directives(ws_w)) == 2
 
 
-async def test_a_resume_forgets_the_strike_streak_it_is_answering(app, client, clock):
-    """/resume hands the client the whole state, so the strikes that asked for
-    it are spent. Leaving them would have the very next mismatching heartbeat
-    direct another one."""
+async def test_an_ignored_directive_costs_a_fresh_pair_of_strikes(app, clock):
+    """The directive is what the strikes buy, so sending one spends them. Left
+    standing, the streak parked itself at the threshold for the rest of the
+    spell and every later mismatching heartbeat became a directive candidate
+    guarded by nothing but the one-second interval."""
     room, ws_w, ws_b = await _live_room(app, clock)
-    room.white.ply_mismatch_streak = RESYNC_STABLE_MISMATCH_HEARTBEATS
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_directed"
+    assert room.white.ply_mismatch_streak == 0
+
+    clock.advance(RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS + 0.1)
+    out = await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+
+    assert out == "ping_strike", "the interval has reopened; the streak has not"
+    assert len(_directives(ws_w)) == 1
+
+
+async def test_a_resume_forgets_the_strike_streak_it_is_answering(app, client, clock):
+    """The real sequence: strikes earn a directive, the client obeys it with a
+    /resume, and the first heartbeat after that still reports the old ply
+    because the answer is only just being applied. That heartbeat is a first
+    strike, not a second one -- /resume handed over the whole state, so
+    whatever was counted against this player before it is spent."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_directed"
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
 
     resp = client.post("/resume", json={
         "version": PROTOCOL_VERSION, "room_id": room.room_id,
@@ -380,7 +407,46 @@ async def test_a_resume_forgets_the_strike_streak_it_is_answering(app, client, c
 
     assert resp.status_code == 200
     assert room.white.ply_mismatch_streak == 0
+    clock.advance(RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS + 0.1)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    assert len(_directives(ws_w)) == 1, "one order, one answer, no second order"
+
+
+async def test_a_resume_tells_the_opponent_the_board_is_being_rebuilt(app, client, clock):
+    """The other half of the same block, and the reason it is guarded at all:
+    a /resume from a live socket is a repair in progress, so the opponent's
+    strip says so instead of showing a player who has just gone quiet. Only the
+    strike reset sits outside that guard -- being told the whole state is not
+    conditional on anyone else hearing about it."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+
+    resp = client.post("/resume", json={
+        "version": PROTOCOL_VERSION, "room_id": room.room_id,
+        "session_token": room.white.session_token,
+    })
+
+    assert resp.status_code == 200
     assert room.white.desync_active is True
+    assert [m["opp_state"] for m in ws_b.of_type("connection_status")] == ["resyncing"]
+
+
+async def test_a_landed_move_clears_the_movers_strike(app, clock):
+    """A player who makes a legal move has proved their board is the server's:
+    the move was generated on it and accepted against it. That is the same
+    proof a matching heartbeat gives, so it spends the strikes too -- otherwise
+    a strike from before the move survives into the next mismatch and turns the
+    first heartbeat that lags behind a broadcast into a repair order."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    assert room.white.ply_mismatch_streak == 1
+
+    await handle_move(app, ws_w, room, "white", _move_raw("e2", "e4"))
+
+    assert room.white.ply_mismatch_streak == 0
+    assert room.white.desync_active is False, "nothing was ever repaired here"
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    assert _directives(ws_w) == []
 
 
 async def test_a_lagging_spell_logs_one_line_however_long_it_lasts(app, clock, caplog):
@@ -514,6 +580,7 @@ async def _scenario_ping_gated(app, clock):
     room, ws_w, ws_b = await _live_room(app, clock)
     await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
     await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
     return room, ws_w, "white", _ping_raw(7)
 
 
@@ -557,7 +624,9 @@ async def test_an_unparseable_heartbeat_is_refused_before_the_pong(app, clock):
 
 def _ping_outcome_words():
     """Every string literal handle_ping can return, read off the AST so a new
-    branch cannot be added without joining the vocabulary."""
+    branch cannot be added without joining the vocabulary. The whole returned
+    expression is searched, not just a bare constant, so picking between two
+    words on the way out still declares both."""
     source = read_source_without_docstrings(
         os.path.join(SERVER_ROOT, "handlers.py"))
     tree = ast.parse(source)
@@ -565,9 +634,11 @@ def _ping_outcome_words():
               if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_ping")
     words = set()
     for node in ast.walk(fn):
-        if (isinstance(node, ast.Return) and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)):
-            words.add(node.value.value)
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        for child in ast.walk(node.value):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                words.add(child.value)
     return words
 
 
@@ -581,26 +652,45 @@ def test_the_ping_outcome_vocabulary_is_closed():
     assert _ping_outcome_words() == set(PING_OUTCOMES) | {"invalid_ping"}
 
 
+class _HistoryCallVisitor(ast.NodeVisitor):
+    """Walks a module and files every history-changing call under the def it
+    is written in. A nested def is a def of its own, so the visitor descends
+    into it under its own name rather than crediting the outer one -- plain
+    ast.walk cannot express that, since skipping a nested FunctionDef in the
+    loop body does not stop walk() from yielding everything inside it."""
+
+    def __init__(self):
+        """Start with no enclosing def and nothing filed."""
+        self.sites = {}
+        self._enclosing = None
+
+    def _visit_def(self, node):
+        """Make this def the enclosing one for everything it contains, then
+        hand the name back to whatever def contains it."""
+        outer, self._enclosing = self._enclosing, node.name
+        self.generic_visit(node)
+        self._enclosing = outer
+
+    visit_FunctionDef = _visit_def
+    visit_AsyncFunctionDef = _visit_def
+
+    def visit_Call(self, node):
+        """File a call under the def it sits in when it can change a move
+        history, then keep walking so nested calls are seen too."""
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) \
+            else getattr(func, "id", None)
+        if name in HISTORY_CALL_NAMES and self._enclosing is not None:
+            self.sites.setdefault(self._enclosing, []).append(node.lineno)
+        self.generic_visit(node)
+
+
 def _history_call_sites(path):
     """Enclosing def name for every call that can change a Backend's move
     history, keyed by name because that is what a new site would be spelled as."""
-    tree = ast.parse(read_source_without_docstrings(path), filename=path)
-    enclosing = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for child in ast.walk(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and child is not node:
-                continue
-            if not isinstance(child, ast.Call):
-                continue
-            func = child.func
-            name = func.attr if isinstance(func, ast.Attribute) \
-                else getattr(func, "id", None)
-            if name in HISTORY_CALL_NAMES:
-                enclosing.setdefault(node.name, []).append(child.lineno)
-    return enclosing
+    visitor = _HistoryCallVisitor()
+    visitor.visit(ast.parse(read_source_without_docstrings(path), filename=path))
+    return visitor.sites
 
 
 def test_only_the_four_stamping_functions_touch_the_move_history():

@@ -1026,19 +1026,24 @@ async def set_resyncing(connections: ConnectionRegistry, room: Room, color: str,
 async def clear_resyncing(app: FastAPI, room: Room, color: str) -> None:
     """
     Mark a player as caught up again and tell the opponent, called whenever
-    the client proves it is on the right ply. It also lets the notification
-    gate reopen shortly, so a fresh lagging spell is reported promptly instead
-    of being swallowed by the previous interval
+    the client proves it is on the right ply. Proof of being caught up always
+    spends the strikes counted against that player, whether or not a repair
+    was ever ordered, so a mismatch that a landed move has since explained
+    cannot be carried into the next lagging spell. It also lets the
+    notification gate reopen shortly, so a fresh spell is reported promptly
+    instead of being swallowed by the previous interval
 
     :param app: the FastAPI application, source of the shared server state.
     :param room: the room the recovered player is in.
     :param color: the side that has caught up, white or black.
     """
     slot = room.slot(color)
-    if slot is None or not slot.desync_active:
+    if slot is None:
+        return
+    slot.ply_mismatch_streak = 0
+    if not slot.desync_active:
         return
     slot.desync_active = False
-    slot.ply_mismatch_streak = 0
     log.info("resync cleared room=%s color=%s", room.room_id, color)
     _resync_gate(app).reopen((room.room_id, color, RESYNC_NOTIFY), app.state.now(),
                              RESYNC_NOTIFY_FLAP_FLOOR_SECONDS)
@@ -1055,7 +1060,10 @@ async def handle_ping(app: FastAPI, websocket: WebSocket, room: Room, color: str
     never judged, and a ply explained by a very recent move or takeback is read
     as news still in flight. Only a mismatch that survives two judged
     heartbeats earns a repair, and both the order to refetch and the note to
-    the opponent are debounced on top
+    the opponent are debounced on top. Ordering one spends those heartbeats,
+    so a client that ignores an order has to mismatch afresh before it is sent
+    another; the order goes out before the note so the ply it names is the one
+    just read off this room's board
 
     :param app: the FastAPI application, source of the shared server state.
     :param websocket: the socket the heartbeat arrived on.
@@ -1077,7 +1085,6 @@ async def handle_ping(app: FastAPI, websocket: WebSocket, room: Room, color: str
     server_ply = len(room.backend.move_history)
     slot = cast(PlayerSlot, room.slot(color))
     if msg.ply == server_ply:
-        slot.ply_mismatch_streak = 0
         await clear_resyncing(app, room, color)
         return "ping"
     if not room.game_start_broadcast:
@@ -1091,19 +1098,20 @@ async def handle_ping(app: FastAPI, websocket: WebSocket, room: Room, color: str
     if slot.ply_mismatch_streak < RESYNC_STABLE_MISMATCH_HEARTBEATS:
         return "ping_strike"
     gate = _resync_gate(app)
+    streak = slot.ply_mismatch_streak
+    age_s = _newest_change_age(room, now)
+    directed = gate.allow((room.room_id, color, RESYNC_DIRECTIVE), now,
+                          RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS)
+    if directed:
+        await send(connections.get_for_color(room, color),
+                   ResyncDirectiveMessage(server_ply=server_ply))
+        slot.ply_mismatch_streak = 0
     if (not slot.desync_active
             and gate.allow((room.room_id, color, RESYNC_NOTIFY), now,
                            RESYNC_NOTIFY_MIN_INTERVAL_SECONDS)):
         await set_resyncing(connections, room, color, client_ply=msg.ply,
-                            server_ply=server_ply,
-                            age_s=_newest_change_age(room, now),
-                            streak=slot.ply_mismatch_streak)
-    if gate.allow((room.room_id, color, RESYNC_DIRECTIVE), now,
-                  RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS):
-        await send(connections.get_for_color(room, color),
-                   ResyncDirectiveMessage(server_ply=server_ply))
-        return "ping_directed"
-    return "ping_gated"
+                            server_ply=server_ply, age_s=age_s, streak=streak)
+    return "ping_directed" if directed else "ping_gated"
 
 
 async def _relay_guard(websocket: WebSocket, room: Room, color: str, limiter: Any,

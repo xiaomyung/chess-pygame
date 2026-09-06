@@ -385,10 +385,15 @@ def test_flapping_ping_cannot_amplify_resync_directives(client, clock):
 
 
 def test_sustained_desync_keeps_directing_resync_promptly(client, clock):
-    """The debounce must not slow a real recovery: a client that is genuinely
-    behind is directed on its very first mismatching ping, and again on the next
-    heartbeat -- the directive interval is shorter than the heartbeat, so an
-    honest client's cadence never hits the gate."""
+    """The debounce must not slow a real recovery: a client that stays behind
+    earns its next directive as soon as it has mismatched afresh, and the
+    directive interval is shorter than the heartbeat, so what holds the second
+    order back is only the strikes -- never the gate.
+
+    Sending an order spends the strikes that bought it, so the heartbeat right
+    after one gets a pong and nothing else. That is the point: a client that
+    never answers must not be handed a fresh /resume order every couple of
+    seconds for the rest of the game."""
     from chessshootout.server.handlers import RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS
     from chessshootout.server.protocol import HEARTBEAT_INTERVAL_SECONDS
 
@@ -410,11 +415,16 @@ def test_sustained_desync_keeps_directing_resync_promptly(client, clock):
             first = {json.loads(ws_w.receive_text())["type"] for _ in range(2)}
             assert first == {"pong", "resync_directive"}
 
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS - 1):
+                clock.advance(HEARTBEAT_INTERVAL_SECONDS)
+                ws_w.send_text(json.dumps(_ping(7)))
+                assert json.loads(ws_w.receive_text())["type"] == "pong", \
+                    "the ignored order is not simply repeated on the next beat"
             clock.advance(HEARTBEAT_INTERVAL_SECONDS)
             ws_w.send_text(json.dumps(_ping(7)))
             second = {json.loads(ws_w.receive_text())["type"] for _ in range(2)}
             assert second == {"pong", "resync_directive"}, \
-                "a client already on strike is directed again on its next heartbeat"
+                "but a client still behind after a fresh pair is directed again"
 
 
 def test_reconnecting_client_gets_opponent_present_snapshot(client):
@@ -941,8 +951,10 @@ def test_an_offboard_client_obeys_a_directive_about_ply_zero():
 def test_a_repeated_directive_while_resyncing_changes_nothing(caplog):
     """The server directive debounce is one per second, so a client whose
     /resume is slow will be ordered again mid-repair. That must not restart the
-    self-heal timer -- doing so would let a wedged resync spin forever -- and
-    must not write a second line."""
+    self-heal timer -- doing so would let a wedged resync spin forever -- and it
+    must go by in total silence: a repair already running is not news, and a
+    stuck client would otherwise write a WARNING every second it stayed
+    stuck."""
     app = _online_app()
     app.coordinator.client.state = "connected"
     app.coordinator._handle_online_event(_directive(server_ply=4))
@@ -954,7 +966,7 @@ def test_a_repeated_directive_while_resyncing_changes_nothing(caplog):
 
     assert app.coordinator._resync_started_at_ms == started_at
     assert app.coordinator.client.request_state_sync.call_count == 1
-    assert [r for r in caplog.records if "resync begin" in r.getMessage()] == []
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def _cause_server_directive():
@@ -1179,15 +1191,22 @@ def test_no_heartbeat_is_sent_while_a_skill_check_verdict_is_pending():
 
 def test_the_spectator_is_silent_through_the_verdict_too():
     """The opponent watches the check as a read-only mirror and applies the same
-    verdict action, so their window is the same shape as the mover's."""
+    verdict action, so their window is the same shape as the mover's. Driven
+    through the real verdict the server broadcasts -- skill_check_result, which
+    only ever carries a miss -- so the flag being set is the production path's
+    doing rather than the test's."""
     from tests.online.test_online_skillcheck_client import (
-        _capture_board, _online_app as _skillcheck_app, _spectate_payload,
+        _capture_board, _online_app as _skillcheck_app, _result, _spectate_payload,
     )
     app = _skillcheck_app("black")
     app.screen = app.game
     frm, to = _capture_board(app)
     app.coordinator._handle_skill_check_spectate(_spectate_payload(frm, to))
-    app.game.skillcheck_session.online_verdict_action = lambda: None
+
+    app.coordinator._handle_skill_check_result(_result(frm, to))
+
+    assert app.game.skillcheck_session.online_verdict_action is not None, \
+        "the real spectate verdict is what opens the window, not a hand-set flag"
     app.coordinator._last_heartbeat_sent_ms = pg.time.get_ticks() - 5000
 
     app.coordinator._send_heartbeat_if_due()

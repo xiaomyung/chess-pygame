@@ -493,6 +493,8 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             token for it
         """
         if body.version != PROTOCOL_VERSION:
+            log.info("matchmake rejected uuid=%s reason=%s version=%d",
+                     body.client_uuid[:8], Reason.VERSION_MISMATCH, body.version)
             raise HTTPException(status_code=426,
                                 detail={"reason": Reason.VERSION_MISMATCH})
         if client_version_outdated(body.client_version, MIN_CLIENT_VERSION):
@@ -655,10 +657,10 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
             idle_window=idle_window_wire(room, app.state.now()),
         )
         log.info("resume served room=%s color=%s ply=%d", body.room_id, color, len(history))
+        slot.ply_mismatch_streak = 0
         if (connections.get_for_color(room, cast(str, color)) is not None
                 and not slot.desync_active):
             slot.desync_active = True
-            slot.ply_mismatch_streak = 0
             opp_ws = connections.get_for_color(
                 room, room.opp_color(cast(str, color)))
             if opp_ws is not None:

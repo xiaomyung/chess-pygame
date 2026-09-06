@@ -484,30 +484,36 @@ class OnlineCoordinator:
 
     def _handle_resync_directive(self, payload: dict[str, Any]) -> None:
         """
-        Obey the server's order to rebuild the game, unless this client has
-        already caught up to the very ply the order was written against -- an
-        order the network delayed past its own answer. Anything unreadable in
-        the payload is treated as an order worth obeying
+        Obey the server's order to rebuild the game, unless a rebuild is
+        already under way or this client has already caught up to the very ply
+        the order was written against -- an order the network delayed past its
+        own answer. Anything unreadable in the payload is treated as an order
+        worth obeying, and printed as a repr so a server sending text where a
+        ply belongs cannot forge a second log line
 
         :param payload: resync-directive message, carrying the ply the server
             was on when it decided.
         """
+        if self._resyncing:
+            return
         server_ply = payload.get("server_ply")
         client_ply = self._heartbeat_ply()
-        if (isinstance(server_ply, int) and client_ply is not None
-                and server_ply == client_ply):
-            log.debug("resync directive server_ply=%d stale=True", server_ply)
-            return
-        log.warning("resync directive server_ply=%s", server_ply)
+        if isinstance(server_ply, int):
+            if client_ply is not None and server_ply == client_ply:
+                log.debug("resync directive server_ply=%d stale=True", server_ply)
+                return
+            log.warning("resync directive server_ply=%d", server_ply)
+        else:
+            log.warning("resync directive server_ply=%r", server_ply)
         self._begin_resync(ResyncCause.SERVER_DIRECTIVE)
 
     def _handle_online_error(self, payload: dict[str, Any]) -> None:
         """
         Decide what a rejection or failure from the server should look like to
         the player: silence for ordinary game-state answers, a toast for
-        transient ones, an update card for a build the server will not take, and
-        a confirm dialog with Retry for the hard failures. A reason string the
-        server supplied is truncated before it reaches a toast
+        transient ones, a one-button update card for a build the server will
+        not take, and a confirm dialog with Retry for the hard failures. A
+        reason string the server supplied is truncated before it reaches a toast
 
         :param payload: error message, keyed by reason plus the message type it
             is answering
@@ -565,8 +571,7 @@ class OnlineCoordinator:
             self.app.confirm_modal.show(
                 UPDATE_REQUIRED_TITLE,
                 on_yes=self._on_online_cancel,
-                on_no=self._on_online_cancel,
-                yes_label=UPDATE_REQUIRED_BUTTON,
+                yes_label=UPDATE_REQUIRED_BUTTON, no_label="",
                 sub=self._update_required_sub(reason, payload),
             )
             return

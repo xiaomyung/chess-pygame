@@ -281,6 +281,7 @@ def test_an_outdated_build_shows_the_update_card_naming_both_versions(
     assert frontend.confirm_modal.sub == (
         "You run v2.12.2 · this server needs v2.13.0 or newer — update your install")
     assert frontend.confirm_modal.yes_label == "OK"
+    assert frontend.confirm_modal.no_label == "", "one answer, one button"
     assert frontend.confirm_modal.emoji is None
     assert not frontend.coordinator.wait_modal.is_visible(), \
         "the search card comes down, or the player watches a dead spinner"
@@ -335,28 +336,22 @@ def test_a_protocol_gap_shows_the_update_card_with_direction_neutral_copy(fronte
     assert Reason.VERSION_MISMATCH not in ONLINE_GAME_STATE_REASONS
 
 
-@pytest.mark.parametrize(
-    "button",
-    [
-        pytest.param("yes", id="the_ok_button"),
-        pytest.param("no", id="the_second_button_of_the_shared_shell"),
-    ],
-)
-def test_dismissing_the_update_card_puts_the_player_back_on_the_play_card(
-    frontend, monkeypatch, button,
-):
-    """The confirm shell always draws two buttons, so BOTH are wired to the same
-    cancel: whichever one is clicked, the search is given up and the menu's play
-    card comes back. A button that only hid the box would strand the player on a
-    menu with no play card on it."""
+def test_the_update_card_offers_the_one_answer_there_is(frontend, monkeypatch):
+    """There is nothing to choose here -- the build is refused whichever button
+    is pressed -- so the card carries a single OK rather than a cancel wired to
+    the same place. Answering gives up the search and brings the menu's play
+    card back; a button that only hid the box would strand the player on a menu
+    with no play card on it."""
     cancelled = []
     monkeypatch.setattr(frontend.coordinator, "_on_online_cancel",
                         lambda: cancelled.append(True))
 
     frontend.coordinator._handle_online_error({"reason": Reason.CLIENT_OUTDATED})
     frontend.confirm_modal.draw()
+
+    assert set(frontend.confirm_modal.button_rects) == {"yes"}
     frontend.confirm_modal.handle_click(
-        frontend.confirm_modal.button_rects[button].center)
+        frontend.confirm_modal.button_rects["yes"].center)
 
     assert cancelled == [True]
     assert not frontend.confirm_modal.is_visible()

@@ -75,6 +75,29 @@ def test_affirmative_is_primary_and_on_the_right():
     assert m.button_rects["no"].x < m.button_rects["yes"].x
 
 
+def test_an_empty_cancel_label_leaves_that_button_out():
+    """The one-answer card (Update required): nothing about it can be cancelled,
+    so a second button would only be a second way to say OK. An empty cancel
+    label drops the button from the row the same way on_extra=None drops the
+    third one -- and out of the hit map with it, since the rects the row hands
+    back ARE what clicks are tested against."""
+    fired = []
+    m = _modal()
+    m.show("Update required", lambda: fired.append("yes"),
+           on_no=lambda: fired.append("no"), yes_label="OK", no_label="")
+    m.window.fill((0, 0, 0))
+    m.draw()
+
+    assert set(m.button_rects) == {"yes"}
+    assert abs(m.button_rects["yes"].centerx - m._panel.centerx) <= 1, "centred"
+    assert _has_color(m.window, m.button_rects["yes"].inflate(-8, -8), Colors.accent, 20)
+
+    m.handle_click(m.button_rects["yes"].center)
+
+    assert fired == ["yes"]
+    assert m.is_visible() is False
+
+
 def test_sub_body_renders():
     m = _modal()
     m.window.fill((0, 0, 0))

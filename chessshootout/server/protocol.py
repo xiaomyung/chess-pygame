@@ -1,3 +1,4 @@
+import math
 import os
 import re
 from typing import Literal, NamedTuple
@@ -22,7 +23,9 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     Read one server tuning knob out of the process environment as a float, so an
     operator can retune timings per deployment without a rebuild. A value that
     is not a number, or one below the floor that keeps the setting workable, is
-    reported and replaced rather than allowed to break the running server
+    reported and replaced rather than allowed to break the running server.
+    Infinities and nan parse as floats but are no more usable than a zero -- a
+    nan compares false against every floor -- so they take the floor too
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.
@@ -38,7 +41,7 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     except ValueError:
         log.warning("env unparsable name=%s default=%s", name, default)
         return default
-    if value < minimum:
+    if not math.isfinite(value) or value < minimum:
         log.warning("env clamped name=%s value=%s minimum=%s", name, value, minimum)
         return minimum
     return value
@@ -48,7 +51,8 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
     """
     Read one server tuning knob out of the process environment as an integer,
     the counting counterpart of the float reader. It reports and replaces an
-    unreadable or too-small value the same way
+    unreadable or too-small value the same way; there is no infinity to guard
+    against here, since int() refuses those spellings outright
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.

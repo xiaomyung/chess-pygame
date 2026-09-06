@@ -37,6 +37,7 @@ from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
 from tests.helpers import FakeClock, fake_uuid4
 from tests.server.conftest import ALICE, BOB, auth_msg
 from tests.server.test_server_broadcasts import RecordingWS
+from tests.server.test_server_logging import KV_TOKEN_RE
 
 
 async def _sweep(app):
@@ -181,6 +182,29 @@ def test_matchmake_refuses_a_body_stamped_with_another_protocol(client):
     assert r.status_code == 426
     assert r.json() == {"detail": {"reason": Reason.VERSION_MISMATCH}}
     assert client.get("/healthz").json()["queue_depth"] == 0
+
+
+def test_a_protocol_gap_refusal_says_so_in_the_journal(client, caplog):
+    """The gate refuses before the endpoint's own matchmake line, so with no
+    line of its own the request left no trace at all: an operator looking into
+    a player who cannot get into a game would see nothing rather than the
+    reason. The version is an int off a validated model, so it can carry no
+    forged second line."""
+    with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
+        r = client.post("/matchmake", json={
+            "version": PROTOCOL_VERSION - 1, "client_uuid": ALICE, "nickname": "Alice",
+            "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
+        })
+
+    assert r.status_code == 426
+    records = [rec.getMessage() for rec in caplog.records
+               if rec.name == "chess.server.app"]
+    assert records == [f"matchmake rejected uuid={ALICE[:8]} "
+                       f"reason={Reason.VERSION_MISMATCH} "
+                       f"version={PROTOCOL_VERSION - 1}"]
+    prefix = records[0][:KV_TOKEN_RE.search(records[0]).start()]
+    assert prefix.strip() and "=" not in prefix and prefix[0].islower()
+    assert dict(KV_TOKEN_RE.findall(records[0])).keys() == {"uuid", "reason", "version"}
 
 
 @pytest.mark.parametrize(

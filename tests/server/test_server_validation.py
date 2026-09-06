@@ -406,6 +406,10 @@ def test_an_unparsable_tuning_value_falls_back_and_says_so(
     [
         pytest.param(_env_float, "0", 60.0, MIN_GRACE_SECONDS, id="float"),
         pytest.param(_env_int, "0", 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+        pytest.param(_env_float, "nan", 60.0, MIN_GRACE_SECONDS, id="float_nan"),
+        pytest.param(_env_float, "inf", 60.0, MIN_GRACE_SECONDS, id="float_infinity"),
+        pytest.param(_env_float, "-inf", 60.0, MIN_GRACE_SECONDS,
+                     id="float_negative_infinity"),
     ],
 )
 def test_a_tuning_value_below_its_floor_is_clamped_and_says_so(
@@ -413,7 +417,12 @@ def test_a_tuning_value_below_its_floor_is_clamped_and_says_so(
     """SECURITY-adjacent misconfiguration: a zero heartbeat interval produced a
     zero heartbeat timeout, which disconnects every player the moment they
     connect. A number that would break the server is replaced by the floor
-    rather than obeyed."""
+    rather than obeyed.
+
+    nan and the infinities are the ones a bare `value < minimum` misses:
+    float() accepts all three spellings, nan compares false against every
+    bound, and +inf sails over the floor into a grace period no disconnect ever
+    ends. They are not workable settings, so they take the floor as well."""
     monkeypatch.setenv(TUNING_PROBE, raw)
     with caplog.at_level(logging.WARNING, logger="chess.server.app"):
         assert reader(TUNING_PROBE, default, minimum=minimum) == minimum
