@@ -8,7 +8,10 @@ from chessshootout.server import logging_setup
 from chessshootout.server.broadcasts import broadcast_game_start
 from chessshootout.server.connections import ConnectionRegistry, send
 from chessshootout.server.handlers import HANDLERS, dispatch, peek_type
-from chessshootout.server.limits import UuidRateLimiter
+from chessshootout.server.limits import (
+    MAX_INBOUND_MESSAGE_BYTES, UuidRateLimiter, WS_MESSAGES_PER_SECOND,
+    WS_RATE_WINDOW_SECONDS,
+)
 from chessshootout.server.protocol import (
     AuthMessage, ConnectionStatusMessage, ErrorMessage, PROTOCOL_VERSION, Reason,
     RematchRequestMessage, RematchUpdateMessage, ResultMessage,
@@ -17,11 +20,6 @@ from chessshootout.server.protocol import (
 )
 from chessshootout.server.rooms import PAIRING_WAIT_SECONDS, PlayerSlot, Room, RoomManager
 
-
-MAX_INBOUND_MESSAGE_BYTES = 4096
-
-WS_MESSAGES_PER_SECOND = 30
-WS_RATE_WINDOW_SECONDS = 1.0
 
 log = logging_setup.get_logger("chess.server.app")
 

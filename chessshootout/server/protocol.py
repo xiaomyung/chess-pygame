@@ -34,9 +34,8 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     :param minimum: smallest value the setting is allowed to take.
     :returns: the parsed value, the floor, or the default.
     """
-    try:
-        raw = os.environ[name]
-    except KeyError:
+    raw = os.environ.get(name)
+    if raw is None:
         return default
     try:
         value = float(raw)
@@ -61,9 +60,8 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
     :param minimum: smallest value the setting is allowed to take.
     :returns: the parsed value, the floor, or the default.
     """
-    try:
-        raw = os.environ[name]
-    except KeyError:
+    raw = os.environ.get(name)
+    if raw is None:
         return default
     try:
         value = int(raw)
@@ -140,6 +138,7 @@ WS_CLOSE_PAYLOAD_TOO_LARGE = 1009
 WS_CLOSE_INVALID_TOKEN = 4000
 WS_CLOSE_SERVER_SHUTDOWN = 4002
 WS_CLOSE_SUPERSEDED = 4003
+WS_CLOSE_QUEUE_TIMEOUT = 4004
 
 UUID4_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
@@ -206,11 +205,8 @@ def parse_client_version(raw: object) -> tuple[int, int, int] | None:
         return None
     if not _CLIENT_VERSION_RE.match(raw):
         return None
-    try:
-        major, minor, patch = (int(part) for part in raw.split("."))
-    except ValueError:
-        return None
-    return (major, minor, patch)
+    major, minor, patch = raw.split(".")
+    return (int(major), int(minor), int(patch))
 
 
 def version_text(parsed: tuple[int, int, int]) -> str:

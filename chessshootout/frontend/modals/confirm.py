@@ -59,7 +59,8 @@ class ConfirmModal(BaseModal):
         :param title: the question itself, drawn large and upper-cased
         :param on_yes: run when the confirming button is clicked
         :param on_no: run when the cancelling button is clicked, or None to
-            just close the box
+            just close the box; an empty no_label leaves that button out, and
+            with it any way for this to run
         :param yes_label: text on the confirming button
         :param no_label: text on the cancelling button, or empty to leave that
             button out and state the one answer there is
@@ -185,9 +186,8 @@ class ConfirmModal(BaseModal):
             y += line_h
 
         row = pg.Rect(content.x, content.bottom - btn_h, content.width, btn_h)
-        buttons = [(self.yes_label, "yes")]
-        if self.no_label:
-            buttons.insert(0, (self.no_label, "no"))
+        buttons = [(self.no_label, "no")] if self.no_label else []
+        buttons.append((self.yes_label, "yes"))
         if self.on_extra is not None:
             buttons.append((self.extra_label, "extra"))
         self.button_rects = draw_button_row(

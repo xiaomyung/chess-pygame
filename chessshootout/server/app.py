@@ -33,6 +33,8 @@ from chessshootout.server.ws_session import ws_router
 
 CLOCK_TICK_INTERVAL_SECONDS = 0.1
 DEFAULT_MAX_ROOMS = 100
+ANNOTATION_RATE_WINDOW_SECONDS = 1.0
+CHAT_LIMIT_PER_COOLDOWN = 1
 
 log = logging_setup.get_logger("chess.server.app")
 
@@ -78,14 +80,16 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
     connections = ConnectionRegistry()
     limiter = Limiter(key_func=client_ip_key)
     reclaim_limiter = UuidRateLimiter(
-        RECLAIM_PER_UUID_LIMIT_PER_MINUTE, RECLAIM_WINDOW_SECONDS,
-        now_provider=now_provider,
+        limit_per_minute=RECLAIM_PER_UUID_LIMIT_PER_MINUTE,
+        window_seconds=RECLAIM_WINDOW_SECONDS, now_provider=now_provider,
     )
     annotation_limiter = UuidRateLimiter(
-        ANNOTATIONS_PER_SECOND, 1.0, now_provider=now_provider,
+        limit_per_minute=ANNOTATIONS_PER_SECOND,
+        window_seconds=ANNOTATION_RATE_WINDOW_SECONDS, now_provider=now_provider,
     )
     chat_limiter = UuidRateLimiter(
-        1, CHAT_COOLDOWN_SECONDS, now_provider=now_provider,
+        limit_per_minute=CHAT_LIMIT_PER_COOLDOWN,
+        window_seconds=CHAT_COOLDOWN_SECONDS, now_provider=now_provider,
     )
     started_at = now_provider()
 

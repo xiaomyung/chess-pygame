@@ -9,7 +9,7 @@ from chessshootout.server.connections import ConnectionRegistry, send
 from chessshootout.server.protocol import (
     ConnectionStatusMessage, ErrorMessage, GRACE_SECONDS,
     QUEUE_MAX_WAIT_SECONDS, RESULT_REASON_BY_GAME_RESULT, Reason, RematchUpdateEvent,
-    RematchUpdateMessage,
+    RematchUpdateMessage, WS_CLOSE_QUEUE_TIMEOUT,
 )
 from chessshootout.server.rooms import (
     REMATCH_ABSOLUTE_CAP_SECONDS, REMATCH_IDLE_SECONDS, POST_GAME_DISCONNECT_GRACE,
@@ -21,9 +21,18 @@ log = logging_setup.get_logger("chess.server.app")
 
 
 PREGAME_CONNECT_GRACE_SECONDS = 5.0
-WS_CLOSE_QUEUE_TIMEOUT = 4004
 SWEEP_STALE_SECONDS = 30.0
 SWEEP_ERROR_LOG_INTERVAL_SECONDS = 60.0
+
+STEP_SKILLCHECK_DEADLINE = "skillcheck_deadline"
+STEP_CLOCK_AND_IDLE_WINDOWS = "clock_and_idle_windows"
+STEP_HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+STEP_GRACE_EXPIRED = "grace_expired"
+STEP_DROP_ORPHANS_PRE_GAME = "drop_orphans_pre_game"
+STEP_REAP_ABANDONED_QUEUE = "reap_abandoned_queue"
+STEP_REAP_TIMED_OUT_QUEUE = "reap_timed_out_queue"
+STEP_POST_GAME = "post_game"
+STEP_GC_FINISHED_ROOMS = "gc_finished_rooms"
 
 
 class Sweep:
@@ -31,7 +40,8 @@ class Sweep:
     The server's housekeeping pass over every room, run on a short timer:
     clocks, skill-check deadlines, idle countdowns, disconnects, abandoned
     queue slots and finished rooms. It is where everything that has to happen
-    without a player doing anything happens
+    without a player doing anything happens. It also tracks whether its passes
+    are completing, which the health check reports as a degraded server
     """
 
     def __init__(self, rooms: RoomManager, connections: ConnectionRegistry,
@@ -124,41 +134,25 @@ class Sweep:
         self._suppressed = 0
         self._last_error_log_at = now
 
-    async def _guard(self, step: str, run: Callable[[], Awaitable[None]]) -> None:
+    async def _guard(self, step: str, run: Callable[[], Awaitable[None] | None]) -> None:
         """
         Run one step of the pass behind its own safety net, so a step that fails
         costs only its own work: every later step in the same pass still runs,
-        and the loop driving the pass stays alive
+        and the loop driving the pass stays alive. Steps that walk the rooms
+        catch their own failures per room; what this net covers is the setup
+        around such a walk, and the whole of a step that has no loop at all.
+        Both a plain step and an awaitable one are accepted, so no step needs a
+        wrapper to be guarded
 
         :param step: name of the step, reported when it fails.
         :param run: the step to run.
         """
         try:
-            await run()
+            outcome = run()
+            if outcome is not None:
+                await outcome
         except Exception as exc:
             self._note_failure(step, exc)
-
-    async def _run_drop_orphans_pre_game(self) -> None:
-        """
-        Run the pre-game orphan drop through the guarded step signature. It
-        reaches the step by attribute rather than by a saved reference, so the
-        step in force when the pass runs is the one that runs
-        """
-        self.step_drop_orphans_pre_game()
-
-    async def _run_reap_abandoned_queue(self) -> None:
-        """
-        Run the abandoned-queue reap through the guarded step signature, going
-        through the attribute for the same reason the orphan drop does
-        """
-        self.step_reap_abandoned_queue()
-
-    async def _run_gc_finished_rooms(self) -> None:
-        """
-        Run the finished-room cleanup through the guarded step signature, going
-        through the room manager's attribute for the same reason
-        """
-        self.rooms.gc_finished_rooms()
 
     async def step_all(self) -> None:
         """
@@ -169,15 +163,15 @@ class Sweep:
         when all of them got through without a failure
         """
         self._pass_clean = True
-        await self._guard("skillcheck_deadline", self.step_skillcheck_deadline)
-        await self._guard("clock_and_idle_windows", self.step_clock_and_idle_windows)
-        await self._guard("heartbeat_timeout", self.step_heartbeat_timeout)
-        await self._guard("grace_expired", self.step_grace_expired)
-        await self._guard("drop_orphans_pre_game", self._run_drop_orphans_pre_game)
-        await self._guard("reap_abandoned_queue", self._run_reap_abandoned_queue)
-        await self._guard("reap_timed_out_queue", self.step_reap_timed_out_queue)
-        await self._guard("post_game", self.step_post_game)
-        await self._guard("gc_finished_rooms", self._run_gc_finished_rooms)
+        await self._guard(STEP_SKILLCHECK_DEADLINE, self.step_skillcheck_deadline)
+        await self._guard(STEP_CLOCK_AND_IDLE_WINDOWS, self.step_clock_and_idle_windows)
+        await self._guard(STEP_HEARTBEAT_TIMEOUT, self.step_heartbeat_timeout)
+        await self._guard(STEP_GRACE_EXPIRED, self.step_grace_expired)
+        await self._guard(STEP_DROP_ORPHANS_PRE_GAME, self.step_drop_orphans_pre_game)
+        await self._guard(STEP_REAP_ABANDONED_QUEUE, self.step_reap_abandoned_queue)
+        await self._guard(STEP_REAP_TIMED_OUT_QUEUE, self.step_reap_timed_out_queue)
+        await self._guard(STEP_POST_GAME, self.step_post_game)
+        await self._guard(STEP_GC_FINISHED_ROOMS, self.rooms.gc_finished_rooms)
         if self._pass_clean:
             self._last_ok_at = self._now()
 
@@ -198,8 +192,7 @@ class Sweep:
                              room.room_id, pending.color, pending.kind.value)
                     await resolve_skillcheck_fail(self.rooms, self.connections, room)
             except Exception as exc:
-                self._note_failure("skillcheck_deadline", exc)
-                continue
+                self._note_failure(STEP_SKILLCHECK_DEADLINE, exc)
 
     async def step_heartbeat_timeout(self) -> None:
         """
@@ -215,8 +208,7 @@ class Sweep:
                 if opp_ws is not None:
                     await send(opp_ws, ConnectionStatusMessage(opp_state="reconnecting"))
             except Exception as exc:
-                self._note_failure("heartbeat_timeout", exc)
-                continue
+                self._note_failure(STEP_HEARTBEAT_TIMEOUT, exc)
 
     async def step_clock_and_idle_windows(self) -> None:
         """
@@ -242,8 +234,7 @@ class Sweep:
                     continue
                 await self._step_idle_timeout(room)
             except Exception as exc:
-                self._note_failure("clock_and_idle_windows", exc)
-                continue
+                self._note_failure(STEP_CLOCK_AND_IDLE_WINDOWS, exc)
 
     async def _step_idle_timeout(self, room: Room) -> None:
         """
@@ -289,8 +280,7 @@ class Sweep:
                 await finalize_and_broadcast(self.rooms, self.connections, room,
                                              Reason.ABANDONMENT, winner_color=winner)
             except Exception as exc:
-                self._note_failure("grace_expired", exc)
-                continue
+                self._note_failure(STEP_GRACE_EXPIRED, exc)
 
     def step_drop_orphans_pre_game(self) -> None:
         """
@@ -315,8 +305,7 @@ class Sweep:
                     log.info("drop room=%s reason=both_disconnected_pre_game", room.room_id)
                     self.rooms.drop_room_now(room.room_id)
             except Exception as exc:
-                self._note_failure("drop_orphans_pre_game", exc)
-                continue
+                self._note_failure(STEP_DROP_ORPHANS_PRE_GAME, exc)
 
     def step_reap_abandoned_queue(self) -> None:
         """
@@ -333,8 +322,7 @@ class Sweep:
                 log.info("drop room=%s reason=queue_abandoned", room.room_id)
                 self.rooms.drop_queued_room(room)
             except Exception as exc:
-                self._note_failure("reap_abandoned_queue", exc)
-                continue
+                self._note_failure(STEP_REAP_ABANDONED_QUEUE, exc)
 
     async def step_reap_timed_out_queue(self) -> None:
         """
@@ -358,8 +346,7 @@ class Sweep:
                 except (RuntimeError, WebSocketDisconnect) as exc:
                     log.debug("ws close on queue timeout failed: %s", exc)
             except Exception as exc:
-                self._note_failure("reap_timed_out_queue", exc)
-                continue
+                self._note_failure(STEP_REAP_TIMED_OUT_QUEUE, exc)
 
     async def _notify_rematch(self, room: Room, color: str,
                               event: RematchUpdateEvent) -> None:
@@ -434,5 +421,4 @@ class Sweep:
                     log.info("drop room=%s reason=rematch_idle", room.room_id)
                     self.rooms.drop_room_now(room.room_id)
             except Exception as exc:
-                self._note_failure("post_game", exc)
-                continue
+                self._note_failure(STEP_POST_GAME, exc)

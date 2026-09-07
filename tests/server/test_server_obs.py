@@ -19,7 +19,8 @@ from chessshootout.server.protocol import (
     GRACE_SECONDS, IDLE_RESIGN_SECONDS, PROTOCOL_VERSION,
     RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS, Reason,
 )
-from chessshootout.server.ws_session import WS_MESSAGES_PER_SECOND, _ws_session
+from chessshootout.server.limits import WS_MESSAGES_PER_SECOND
+from chessshootout.server.ws_session import _ws_session
 from chessshootout.server.sweep import PREGAME_CONNECT_GRACE_SECONDS
 from tests.server.conftest import ALICE, BOB, auth_msg
 from tests.server.test_server_broadcasts import RecordingWS

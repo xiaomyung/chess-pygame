@@ -79,7 +79,7 @@ async def _play_game(white, black, stop, rtts, resyncs):
                 rtts.append(time.monotonic() - pending[ws])
                 pending[ws] = None
             elif msg and msg.get("type") == "resync_directive":
-                resyncs.append(1)
+                resyncs[0] += 1
 
     async def beat(ws):
         while not stop.is_set():
@@ -114,7 +114,7 @@ async def _play_game(white, black, stop, rtts, resyncs):
 async def _run(args):
     transport = ServerTransport(args.addr)
     rtts = []
-    resyncs = []
+    resyncs = [0]
     stop = asyncio.Event()
     games = []
     errors = 0
@@ -143,7 +143,7 @@ async def _run(args):
         print(f"ping RTT  p50={p50 * 1000:.1f}ms  p99={p99 * 1000:.1f}ms  samples={len(rtts)}")
     else:
         print("no RTT samples collected")
-    print(f"resync directives: {len(resyncs)}")
+    print(f"resync directives: {resyncs[0]}")
 
 
 def main():

@@ -15,11 +15,12 @@ import pytest
 from chessshootout.backend.utils import Square
 from chessshootout.server.app import create_app
 from chessshootout.server.protocol import (
-    GRACE_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, QUEUE_MAX_WAIT_SECONDS, Reason)
+    GRACE_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, QUEUE_MAX_WAIT_SECONDS, Reason,
+    WS_CLOSE_QUEUE_TIMEOUT)
 from chessshootout.server.rooms import POST_GAME_DISCONNECT_GRACE, QUEUE_ABANDON_SECONDS
 from chessshootout.server.sweep import (
     PREGAME_CONNECT_GRACE_SECONDS, SWEEP_ERROR_LOG_INTERVAL_SECONDS,
-    SWEEP_STALE_SECONDS, WS_CLOSE_QUEUE_TIMEOUT)
+    SWEEP_STALE_SECONDS)
 from tests.server.test_server_broadcasts import RecordingWS
 from tests.helpers import FakeClock, fake_uuid4
 from tests.server.conftest import ALICE, APP_KEY, BOB, clean_sweep

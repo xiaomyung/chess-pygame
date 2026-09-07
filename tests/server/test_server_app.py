@@ -14,7 +14,7 @@ from slowapi import Limiter
 from chessshootout.server import app as app_module
 from chessshootout.server.app import _sweep_loop, create_app
 from chessshootout.server.limits import MATCHMAKE_PER_IP_LIMIT, UuidRateLimiter
-from chessshootout.server.ws_session import MAX_INBOUND_MESSAGE_BYTES
+from chessshootout.server.limits import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.server.broadcasts import broadcast_game_start, idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
 from chessshootout.server.handlers import (

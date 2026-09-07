@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import chessshootout
-from chessshootout.server.ws_session import MAX_INBOUND_MESSAGE_BYTES
+from chessshootout.server.limits import MAX_INBOUND_MESSAGE_BYTES
 from chessshootout.server.protocol import (
     AnnotationDeltaMessage, AnnotationSetWire, AnnotationsStateMessage, ArrowWire,
     AuthMessage, CHAT_PRESET_COUNT, CLIENT_VERSION_MAX_LEN, ClockSnapshot, ErrorMessage,
