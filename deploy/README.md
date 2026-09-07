@@ -83,8 +83,24 @@ EOF
 `HOST=0.0.0.0` lets the edge proxy reach the app over the shared `edge` network. Do not
 set `LOG_FILE` (logs go to stdout). `TRUSTED_PROXIES` is set in `docker-compose.yml`
 (the edge proxy's IP on the `edge` network), not here. Optional tunables you can add to
-`gameserver.env`: `GRACE_SECONDS=60`, `HEARTBEAT_INTERVAL_SECONDS=2`,
-`HEARTBEAT_MISS_LIMIT=3`.
+`gameserver.env`, with the floor each one is held to: `GRACE_SECONDS=60` (min `1.0`),
+`HEARTBEAT_INTERVAL_SECONDS=2` (min `0.5`), `HEARTBEAT_MISS_LIMIT=3` (min `2`).
+
+A tunable that does not parse as a number falls back to its default; one that parses
+but is below its floor — or is an infinity or a nan — is replaced by the floor. Either
+way the server logs a `WARNING` naming the variable and keeps serving; it never starts
+with a zero-second heartbeat because of a typo. These particular warnings are emitted
+while the module is imported, before the log format is configured, so in
+`docker compose logs` they appear as bare stderr lines (`env unparsable name=…` /
+`env clamped name=…`) ahead of the normal timestamped output.
+
+The oldest client build the server accepts is **not** an env knob: `MIN_CLIENT_VERSION`
+is a source constant in `chessshootout/server/protocol.py` (currently `"2.13.0"`), baked
+into the image, and it is reported on the `GET /` manifest. Clients older than it are
+refused at `/matchmake` with a 426; a client that reports no version at all — anyone
+running from source — is admitted. Raise it only in a release that actually ships a
+break, and remember that raising it turns away every older build the moment the new
+image starts.
 
 ### 4. Start
 
@@ -162,6 +178,16 @@ Live logs:
 docker compose logs -f
 ```
 
+The first lines after a start say exactly what is running and with which settings —
+the build and protocol version plus the room cap (`gameserver v6 release=2.13.0
+listening (max_rooms=100)`), the trusted proxy set (`trusted proxies …`, a `WARNING`
+when `TRUSTED_PROXIES` was configured but parsed to nothing), and every timing knob in
+effect on one line (`tuning grace=… heartbeat=… miss_limit=… heartbeat_timeout=…
+tick=… sweep_stale=… transit_grace=… stable_heartbeats=…`). Read that line rather than
+guessing whether a `gameserver.env` edit took. A clean stop logs the matching
+`gameserver shutting down uptime_s=… rooms_active=… queue_depth=… sockets=…` before
+the drain, so a log without it means the process was killed rather than stopped.
+
 Restart:
 
 ```bash
@@ -176,3 +202,53 @@ docker compose down
 
 A clean stop, restart, or update lets the server broadcast `server_shutdown` to
 connected clients; the compose `stop_grace_period` covers the 10 s drain.
+
+### Health endpoint
+
+`GET /healthz` is what the container healthcheck, `update.sh` and the game's own
+connection test all poll:
+
+```bash
+curl -s http://127.0.0.1:8000/healthz
+```
+
+```json
+{
+  "status": "ok",
+  "version": 6,
+  "app_version": "2.13.0",
+  "rooms_active": 3,
+  "queue_depth": 1,
+  "uptime_s": 4210.7,
+  "housekeeping_age_s": 0.4
+}
+```
+
+The verdict is in the body — the endpoint answers **HTTP 200 in every state** this
+release, healthy or not:
+
+- `status` — `ok`, `full` or `degraded`. **`full`** means the room cap is reached
+  (games in progress plus players waiting have hit `MAX_ROOMS`), so the next
+  matchmake request is refused; the server is otherwise fine. **`degraded`** means the
+  server's own housekeeping pass — the loop that expires grace and idle windows, ticks
+  clocks, times out silent sockets and unanswered skill checks, drops orphaned rooms
+  and reaps stale queue entries — has not completed within its staleness threshold. The
+  server still answers and still plays games, but it can no longer be trusted to end
+  them on time. A step that is actually raising also writes a throttled `ERROR` with a
+  traceback, so read the log next.
+- `housekeeping_age_s` — seconds since the last housekeeping pass that completed with
+  no failures, and the number `degraded` is computed from. It reads `0.0` until the
+  loop has started, so a server that has only just come up never calls itself behind.
+- `version` is the wire protocol version, `app_version` the build (empty on a source
+  run), `rooms_active` / `queue_depth` the current load.
+
+Any uptime monitor that can poll a URL and read a JSON field is enough — point one at
+`https://server.chess-shootout.com/healthz` and alert on `status != "ok"`. Nothing in
+this deploy is tied to a particular monitoring product.
+
+The Dockerfile `HEALTHCHECK` and `deploy/update.sh` are unchanged by all this: both
+only ask whether the endpoint answers 200, so a `degraded` server keeps a healthy
+container and an update still reports its before/after versions. Answering non-200 for
+`degraded` is deliberately left to the monitoring work that would own the consumer of
+it — flipping the status code today would make three client paths and `curl -f` read a
+busy-but-working server as unreachable.

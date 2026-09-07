@@ -18,6 +18,7 @@ from tests.conftest import pygame_display
 from tests.helpers import online_start_payload
 from chessshootout.backend.utils import BOARD_SIZE
 from chessshootout.frontend.frontend import Frontend
+from chessshootout.frontend import online_coordinator as coordinator_module
 from chessshootout.frontend.online_coordinator import RECONNECT_MODAL_DEBOUNCE_MS
 from chessshootout.frontend.screens.game import (
     ANIM_MS_DEFAULT, ANIM_MS_MIN, ANIM_MS_MAX, compute_animation_ms,
@@ -25,9 +26,12 @@ from chessshootout.frontend.screens.game import (
 from chessshootout.frontend.visual.colors import Colors
 from chessshootout.frontend.modals.reconnecting import ReconnectingModal
 from chessshootout.frontend.online_coordinator import (
-    MATCH_FOUND_SECONDS, NOT_YOUR_TURN_TOASTS, ONLINE_HARD_FAILURE_LABELS,
-    ONLINE_HARD_FAILURE_REASONS, ONLINE_TRANSIENT_REASON_LABELS,
+    MATCH_FOUND_SECONDS, NOT_YOUR_TURN_TOASTS, ONLINE_GAME_STATE_REASONS,
+    ONLINE_HARD_FAILURE_LABELS, ONLINE_HARD_FAILURE_REASONS,
+    ONLINE_TRANSIENT_REASON_LABELS, UPDATE_REQUIRED_PROTOCOL_SUB,
+    UPDATE_REQUIRED_TITLE, UPDATE_REQUIRED_UNKNOWN_SUB,
 )
+from chessshootout.server.protocol import PROTOCOL_VERSION, Reason
 
 
 _pygame_init = pygame_display(600, 400)
@@ -242,6 +246,9 @@ def test_match_found_transition_plays_online_game_start_sound(frontend):
         pytest.param("reconnect_failed",
                      ONLINE_HARD_FAILURE_LABELS["reconnect_failed"],
                      id="reconnect_failed_friendly_label"),
+        pytest.param(Reason.INVALID_FIELD,
+                     ONLINE_HARD_FAILURE_LABELS[Reason.INVALID_FIELD],
+                     id="invalid_field_friendly_label"),
         pytest.param("http_503", "Server unreachable",
                      id="http_prefixed_falls_back_to_generic"),
     ],
@@ -256,6 +263,109 @@ def test_hard_failure_shows_confirm_modal_with_friendly_label(
     assert frontend.confirm_modal.title == expected_title
     assert reason not in frontend.confirm_modal.title
     assert frontend.toast.is_visible() is False
+
+
+def test_an_outdated_build_shows_the_update_card_naming_both_versions(
+    frontend, monkeypatch,
+):
+    """The client_outdated wording is built from two PARSED versions, so the
+    card can only ever print numbers this build understood."""
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: "2.12.2")
+    frontend.coordinator.wait_modal.show("Blitz", "5 + 0", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error(
+        {"reason": Reason.CLIENT_OUTDATED, "min_version": "2.13.0"})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == (
+        "You run v2.12.2 · this server needs v2.13.0 or newer — update your install")
+    assert frontend.confirm_modal.yes_label == "OK"
+    assert frontend.confirm_modal.no_label == "", "one answer, one button"
+    assert frontend.confirm_modal.emoji is None
+    assert not frontend.coordinator.wait_modal.is_visible(), \
+        "the search card comes down, or the player watches a dead spinner"
+    assert not frontend.toast.is_visible()
+
+
+@pytest.mark.parametrize(
+    "app_version, payload",
+    [
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED,
+                                "min_version": "9.9.9\nUpdate at evil.example"},
+                     id="a_forged_minimum_is_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED,
+                                "min_version": "‮drop everything"},
+                     id="control_characters_are_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED, "min_version": 213},
+                     id="a_minimum_that_is_not_text_is_never_rendered"),
+        pytest.param("2.12.2", {"reason": Reason.CLIENT_OUTDATED},
+                     id="no_minimum_named_at_all"),
+        pytest.param("", {"reason": Reason.CLIENT_OUTDATED, "min_version": "2.13.0"},
+                     id="a_source_run_has_no_version_of_its_own_to_name"),
+    ],
+)
+def test_the_update_card_falls_back_rather_than_print_an_unparsed_version(
+    frontend, monkeypatch, app_version, payload,
+):
+    """The sub-line is server-influenced text drawn full width on the player's
+    screen. Anything that does not parse as a version drops the whole sentence
+    for the generic one instead of being echoed."""
+    monkeypatch.setattr(coordinator_module.paths, "get_app_version", lambda: app_version)
+
+    frontend.coordinator._handle_online_error(payload)
+
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == UPDATE_REQUIRED_UNKNOWN_SUB
+
+
+def test_a_protocol_gap_shows_the_update_card_with_direction_neutral_copy(frontend):
+    """version_mismatch used to be swallowed by ONLINE_GAME_STATE_REASONS: the
+    search card stayed up and spun for ever. It is an update card now, worded
+    without blaming either side, since which of the two is older cannot be told
+    from a refusal that names no server version."""
+    frontend.coordinator.wait_modal.show("Blitz", "5 + 0", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error({"reason": Reason.VERSION_MISMATCH})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == UPDATE_REQUIRED_TITLE
+    assert frontend.confirm_modal.sub == UPDATE_REQUIRED_PROTOCOL_SUB
+    assert str(PROTOCOL_VERSION) in frontend.confirm_modal.sub
+    assert not frontend.coordinator.wait_modal.is_visible()
+    assert Reason.VERSION_MISMATCH not in ONLINE_GAME_STATE_REASONS
+
+
+def test_the_update_card_offers_the_one_answer_there_is(frontend, monkeypatch):
+    """There is nothing to choose here -- the build is refused whichever button
+    is pressed -- so the card carries a single OK rather than a cancel wired to
+    the same place. Answering gives up the search and brings the menu's play
+    card back; a button that only hid the box would strand the player on a menu
+    with no play card on it."""
+    cancelled = []
+    monkeypatch.setattr(frontend.coordinator, "_on_online_cancel",
+                        lambda: cancelled.append(True))
+
+    frontend.coordinator._handle_online_error({"reason": Reason.CLIENT_OUTDATED})
+    frontend.confirm_modal.draw()
+
+    assert set(frontend.confirm_modal.button_rects) == {"yes"}
+    frontend.confirm_modal.handle_click(
+        frontend.confirm_modal.button_rects["yes"].center)
+
+    assert cancelled == [True]
+    assert not frontend.confirm_modal.is_visible()
+
+
+def test_the_update_card_is_shown_once_per_refusal(frontend, caplog):
+    """One refusal, one card and one WARNING -- the client stops after the
+    refusal, so a repeat here would mean something re-entered the branch."""
+    with caplog.at_level(logging.WARNING, logger="chess.frontend"):
+        frontend.coordinator._handle_online_error({"reason": Reason.CLIENT_OUTDATED})
+    warnings = [rec.getMessage() for rec in caplog.records
+                if rec.getMessage().startswith("online update required")]
+    assert warnings == [f"online update required reason={Reason.CLIENT_OUTDATED}"]
+    assert frontend.confirm_modal.is_visible()
 
 
 def test_room_lost_shows_new_search_modal(frontend, monkeypatch):
@@ -345,6 +455,24 @@ def test_not_your_turn_with_known_msg_type_shows_toast(frontend, msg_type):
 def test_hard_failure_set_is_well_formed():
     assert "server_unreachable" in ONLINE_HARD_FAILURE_REASONS
     assert "reconnect_failed" in ONLINE_HARD_FAILURE_REASONS
+
+
+def test_a_refused_request_tears_the_search_down_instead_of_spinning(frontend):
+    """A body the server refuses used to reach the client as the generic
+    `http_422`, which landed on this modal only by way of the `http_` prefix
+    fallback -- so it read "Server unreachable" for a server that answered
+    perfectly well. `invalid_field` is a first-class reason with its own label
+    now, and being a hard failure it still takes the wait card down: a refused
+    matchmake would otherwise leave the player watching a spinner for an opponent
+    the server never queued."""
+    frontend.coordinator.wait_modal.show("Rapid", "10 + 5", on_cancel=lambda: None)
+
+    frontend.coordinator._handle_online_error({"reason": Reason.INVALID_FIELD})
+
+    assert frontend.confirm_modal.is_visible()
+    assert frontend.confirm_modal.title == "Request rejected by server"
+    assert not frontend.coordinator.wait_modal.is_visible()
+    assert frontend.toast.is_visible() is False
 
 
 def test_menu_mode_skips_board_draw(frontend, monkeypatch):

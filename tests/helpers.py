@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from chessshootout.backend.backend import Backend, DEFAULT_CASTLING_RIGHTS
 from chessshootout.backend.utils import Square, Move, MoveResult, HistoryEntry
 from chessshootout.backend.pieces import Piece, PieceColor, PieceType
+from chessshootout.server.protocol import PROTOCOL_VERSION
 
 if TYPE_CHECKING:
     import pygame
@@ -526,3 +527,15 @@ def online_start_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def auth_msg(token: str) -> dict[str, Any]:
+    """
+    Build the handshake frame a client must send first on a game websocket: the
+    protocol version the server insists on, plus the session token naming the
+    slot being claimed. No game traffic is accepted before it
+
+    :param token: session token handed out by matchmake, resume or reclaim
+    :returns: the auth frame, ready to send as JSON
+    """
+    return {"version": PROTOCOL_VERSION, "type": "auth", "session_token": token}

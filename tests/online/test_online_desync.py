@@ -5,8 +5,10 @@ comparing the server's `ply` field against `len(move_history)`, fires
 request_state_sync, and gates every further move_applied/takeback behind the
 `_resyncing` flag until _handle_game_resumed clears it.
 """
+import ast
 import json
 import logging
+import os
 import random
 
 from unittest.mock import MagicMock
@@ -15,14 +17,21 @@ import pygame as pg
 import pytest
 from fastapi.testclient import TestClient
 
+import chessshootout
 from tests.conftest import pygame_display
 from chessshootout.domain.match import ONLINE
+from chessshootout.frontend.online_coordinator import ResyncCause
 from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import square_from_coord
 from chessshootout.server import connections as connections_module
-from chessshootout.server.app import PROTOCOL_VERSION, create_app
-from chessshootout.server.protocol import MoveAppliedMessage
-from tests.helpers import FakeClock, fake_uuid4
+from chessshootout.server.app import create_app
+from chessshootout.server.protocol import (
+    MoveAppliedMessage, PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
+    RESYNC_TRANSIT_GRACE_SECONDS,
+)
+from tests.helpers import (
+    FakeClock, auth_msg, fake_uuid4, read_source_without_docstrings,
+)
 
 
 ALICE = fake_uuid4(1)
@@ -56,10 +65,6 @@ def _matchmake(client, *, uuid, nickname, side):
     }).json()
 
 
-def _auth(token):
-    return {"version": PROTOCOL_VERSION, "type": "auth", "session_token": token}
-
-
 def _move(from_sq, to_sq):
     return {"version": PROTOCOL_VERSION, "type": "move",
             "from": from_sq, "to": to_sq}
@@ -84,9 +89,9 @@ def _recv_type(ws, msg_type):
 def test_move_applied_includes_ply(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -104,9 +109,9 @@ def test_move_applied_includes_ply(client):
 def test_takeback_applied_includes_ply(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -130,9 +135,9 @@ def test_takeback_applied_includes_ply(client):
 def test_dropped_broadcast_pushes_reconnecting_to_surviving_peer(client, monkeypatch):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
 
@@ -160,33 +165,115 @@ def _ping(ply):
     return {"version": PROTOCOL_VERSION, "type": "ping", "ply": ply}
 
 
-def test_ping_with_matching_ply_pongs_without_directive(client):
+def _pongs(ws, count):
+    """Frames off one socket up to and including its `count`-th pong. Per-connection
+    FIFO makes this deterministic; a marker sent on the OTHER socket is not."""
+    seen = []
+    while sum(m["type"] == "pong" for m in seen) < count:
+        seen.append(json.loads(ws.receive_text()))
+    return seen
+
+
+def _past_the_transit_grace(clock):
+    """Pairing runs the real broadcast_game_start, which stamps a history change
+    at the fake clock's frozen zero -- and a stamp with no previous length
+    excuses EVERY reported ply while it is fresh. Every test that wants a
+    heartbeat judged has to step past that window first."""
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+
+
+def test_ping_with_matching_ply_pongs_without_directive(client, clock):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
+            _past_the_transit_grace(clock)
             ws_w.send_text(json.dumps(_ping(0)))
             msg = json.loads(ws_w.receive_text())
             assert msg["type"] == "pong"
 
 
-def test_ping_with_wrong_ply_directs_resync_and_flags_opponent(client):
+def test_ping_with_wrong_ply_directs_resync_and_flags_opponent(client, clock):
+    """A directive costs the client a full /resume, so it takes a mismatch that
+    survives RESYNC_STABLE_MISMATCH_HEARTBEATS judged heartbeats -- the first
+    one only earns a pong."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
+            _past_the_transit_grace(clock)
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS - 1):
+                ws_w.send_text(json.dumps(_ping(7)))
+                assert json.loads(ws_w.receive_text())["type"] == "pong"
             ws_w.send_text(json.dumps(_ping(7)))
             got = {json.loads(ws_w.receive_text())["type"] for _ in range(2)}
             assert got == {"pong", "resync_directive"}
             status = json.loads(ws_b.receive_text())
             assert status["type"] == "connection_status"
             assert status["opp_state"] == "resyncing"
+
+
+def test_a_heartbeat_racing_the_opponents_move_is_not_a_desync(client, clock):
+    """The bug this whole commit is about, end to end over the wire: white's
+    move lands on the server and black's heartbeat -- already in the air --
+    still reports the position before it. Black's board is fine; the broadcast
+    simply has not arrived yet."""
+    a, b = _paired_ws(client)
+    with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
+        with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
+            ws_w.receive_text()
+            ws_b.receive_text()
+            _past_the_transit_grace(clock)
+            ws_w.send_text(json.dumps(_move("e2", "e4")))
+            _recv_type(ws_w, "move_applied")
+            _recv_type(ws_b, "move_applied")
+
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS + 2):
+                ws_b.send_text(json.dumps(_ping(0)))
+            ws_b.send_text(json.dumps(_ping(1)))
+
+            seen = [m["type"] for m in _pongs(ws_b, RESYNC_STABLE_MISMATCH_HEARTBEATS + 3)]
+            assert "resync_directive" not in seen
+
+
+def test_a_heartbeat_racing_a_takeback_is_not_a_desync(client, clock):
+    """The mirror case: after an accepted takeback both clients are briefly one
+    AHEAD of the server, which is the opposite sign to a move and would fail a
+    one-directional tolerance."""
+    a, b = _paired_ws(client)
+    with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
+        with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
+            ws_w.receive_text()
+            ws_b.receive_text()
+            _past_the_transit_grace(clock)
+            ws_w.send_text(json.dumps(_move("e2", "e4")))
+            _recv_type(ws_w, "move_applied")
+            _recv_type(ws_b, "move_applied")
+            ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                       "type": "takeback_request"}))
+            _recv_type(ws_b, "takeback_offered")
+            ws_b.send_text(json.dumps({"version": PROTOCOL_VERSION,
+                                       "type": "takeback_response",
+                                       "accept": True}))
+            _recv_type(ws_w, "takeback_applied")
+            _recv_type(ws_b, "takeback_applied")
+
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS + 2):
+                ws_w.send_text(json.dumps(_ping(1)))
+            ws_w.send_text(json.dumps(_ping(0)))
+
+            seen = [m["type"] for m in _pongs(ws_w, RESYNC_STABLE_MISMATCH_HEARTBEATS + 3)]
+            assert "resync_directive" not in seen
 
 
 def _quick_chat():
@@ -196,7 +283,10 @@ def _quick_chat():
 def _drain_until_chat(ws):
     """Sentinel drain: quick_chat is relayed straight through with no state of
     its own, so the frame after it is a hard end-of-stream marker -- everything
-    the flapping pings produced has to arrive ahead of it."""
+    the flapping pings produced has to arrive ahead of it, PROVIDED the sentinel
+    is sent on the SAME socket as those pings; per-connection FIFO is what
+    orders it after them, and a marker sent on the other socket proves
+    nothing."""
     seen = []
     while True:
         msg = json.loads(ws.receive_text())
@@ -221,14 +311,17 @@ def test_flapping_ping_notifies_the_opponent_once_per_window(client, clock):
 
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
+            _past_the_transit_grace(clock)
 
-            for i in range(8):
-                ws_w.send_text(json.dumps(_ping(7 if i % 2 == 0 else 0)))
+            for _ in range(4):
+                for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS):
+                    ws_w.send_text(json.dumps(_ping(7)))
+                ws_w.send_text(json.dumps(_ping(0)))
             ws_w.send_text(json.dumps(_quick_chat()))
 
             states = [m["opp_state"] for m in _drain_until_chat(ws_b)
@@ -236,11 +329,35 @@ def test_flapping_ping_notifies_the_opponent_once_per_window(client, clock):
             assert states == ["resyncing", "connected"]
 
             clock.advance(RESYNC_NOTIFY_MIN_INTERVAL_SECONDS + 0.1)
-            ws_w.send_text(json.dumps(_ping(7)))
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS):
+                ws_w.send_text(json.dumps(_ping(7)))
             status = json.loads(ws_b.receive_text())
             assert status["type"] == "connection_status"
             assert status["opp_state"] == "resyncing", (
                 "a fresh window must notify again -- this is a debounce, not a latch")
+
+
+def test_a_pure_ply_alternation_costs_the_opponent_nothing(client, clock):
+    """The cheapest form of the griefing pattern is now free to ignore: the
+    strike counter sits in FRONT of the debounce, so a wrong ply followed by a
+    right one is a first strike immediately wiped. Nothing reaches the notify
+    gate, and nothing reaches the client either."""
+    a, b = _paired_ws(client)
+    with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
+        with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
+            ws_w.receive_text()
+            ws_b.receive_text()
+            _past_the_transit_grace(clock)
+
+            for i in range(8):
+                ws_w.send_text(json.dumps(_ping(7 if i % 2 == 0 else 0)))
+            ws_w.send_text(json.dumps(_quick_chat()))
+
+            assert _drain_until_chat(ws_b) == []
+            ws_b.send_text(json.dumps(_quick_chat()))
+            assert [m["type"] for m in _drain_until_chat(ws_w)] == ["pong"] * 8
 
 
 def test_flapping_ping_cannot_amplify_resync_directives(client, clock):
@@ -251,11 +368,12 @@ def test_flapping_ping_cannot_amplify_resync_directives(client, clock):
     is untouched."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
+            _past_the_transit_grace(clock)
 
             for _ in range(8):
                 ws_w.send_text(json.dumps(_ping(7)))
@@ -275,10 +393,15 @@ def test_flapping_ping_cannot_amplify_resync_directives(client, clock):
 
 
 def test_sustained_desync_keeps_directing_resync_promptly(client, clock):
-    """The debounce must not slow a real recovery: a client that is genuinely
-    behind is directed on its very first mismatching ping, and again on the next
-    heartbeat -- the directive interval is shorter than the heartbeat, so an
-    honest client's cadence never hits the gate."""
+    """The debounce must not slow a real recovery: a client that stays behind
+    earns its next directive as soon as it has mismatched afresh, and the
+    directive interval is shorter than the heartbeat, so what holds the second
+    order back is only the strikes -- never the gate.
+
+    Sending an order spends the strikes that bought it, so the heartbeat right
+    after one gets a pong and nothing else. That is the point: a client that
+    never answers must not be handed a fresh /resume order every couple of
+    seconds for the rest of the game."""
     from chessshootout.server.handlers import RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS
     from chessshootout.server.protocol import HEARTBEAT_INTERVAL_SECONDS
 
@@ -286,20 +409,30 @@ def test_sustained_desync_keeps_directing_resync_promptly(client, clock):
 
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
+            _past_the_transit_grace(clock)
 
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS - 1):
+                ws_w.send_text(json.dumps(_ping(7)))
+                assert json.loads(ws_w.receive_text())["type"] == "pong"
             ws_w.send_text(json.dumps(_ping(7)))
             first = {json.loads(ws_w.receive_text())["type"] for _ in range(2)}
             assert first == {"pong", "resync_directive"}
 
+            for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS - 1):
+                clock.advance(HEARTBEAT_INTERVAL_SECONDS)
+                ws_w.send_text(json.dumps(_ping(7)))
+                assert json.loads(ws_w.receive_text())["type"] == "pong", \
+                    "the ignored order is not simply repeated on the next beat"
             clock.advance(HEARTBEAT_INTERVAL_SECONDS)
             ws_w.send_text(json.dumps(_ping(7)))
             second = {json.loads(ws_w.receive_text())["type"] for _ in range(2)}
-            assert second == {"pong", "resync_directive"}
+            assert second == {"pong", "resync_directive"}, \
+                "but a client still behind after a fresh pair is directed again"
 
 
 def test_reconnecting_client_gets_opponent_present_snapshot(client):
@@ -307,15 +440,15 @@ def test_reconnecting_client_gets_opponent_present_snapshot(client):
     presence, so a client that dropped can't be stuck showing the opponent red."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-        ws_b.send_text(json.dumps(_auth(b["session_token"])))
+        ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
         with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-            ws_w.send_text(json.dumps(_auth(a["session_token"])))
+            ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
             ws_w.receive_text()                       # game_start
             ws_b.receive_text()                       # game_start
         # white dropped -> black is told "reconnecting"; drain it
         assert json.loads(ws_b.receive_text())["type"] == "connection_status"
         with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w2:
-            ws_w2.send_text(json.dumps(_auth(a["session_token"])))
+            ws_w2.send_text(json.dumps(auth_msg(a["session_token"])))
             snap = json.loads(ws_w2.receive_text())
             assert snap["type"] == "connection_status"
             assert snap["opp_state"] == "connected", "opponent b is still here"
@@ -324,14 +457,14 @@ def test_reconnecting_client_gets_opponent_present_snapshot(client):
 def test_reconnecting_client_told_opponent_still_gone(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()                       # game started, both present
         # black dropped inside; now white drops too
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w2:
-        ws_w2.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w2.send_text(json.dumps(auth_msg(a["session_token"])))
         snap = json.loads(ws_w2.receive_text())
         assert snap["type"] == "connection_status"
         assert snap["opp_state"] == "reconnecting", "opponent is still gone"
@@ -340,9 +473,9 @@ def test_reconnecting_client_told_opponent_still_gone(client):
 def test_new_matchmake_abandons_in_progress_game(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -369,6 +502,7 @@ def _online_app():
     app.coordinator.client.is_server_silent.return_value = False
     app.coordinator.client.heartbeat_interval.return_value = 2.0
     app.coordinator.subscribe(app.game)
+    app.screen = app.game
     app.game.variant = "online"
     app.game.white_name = "Alice"
     app.game.black_name = "Bob"
@@ -449,9 +583,9 @@ def test_game_resumed_clears_resync_gate():
 def test_begin_resync_is_idempotent_during_inflight_request():
     """The in-flight flag suppresses duplicate requests across repeated calls."""
     app = _online_app()
-    app.coordinator._begin_resync()
-    app.coordinator._begin_resync()
-    app.coordinator._begin_resync()
+    app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
+    app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
+    app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
     assert app.coordinator._resyncing is True
     assert app.coordinator.client.request_state_sync.call_count == 1
 
@@ -584,7 +718,7 @@ def test_resync_gate_does_not_outlive_the_session_it_belongs_to():
     window, silently gated the new game."""
     for drop in ("_tear_down_online_session", "_on_online_cancel"):
         app = _online_app()
-        app.coordinator._begin_resync()
+        app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
         assert app.coordinator._resyncing is True
 
         getattr(app.coordinator, drop)()
@@ -594,7 +728,7 @@ def test_resync_gate_does_not_outlive_the_session_it_belongs_to():
 
 def test_resync_gate_is_cleared_when_the_socket_is_kept_for_a_rematch():
     app = _online_app()
-    app.coordinator._begin_resync()
+    app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
 
     app.coordinator.retain_for_rematch(True)
 
@@ -607,7 +741,7 @@ def test_resume_with_no_active_online_game_is_dropped_and_clears_the_gate():
     live game to rebuild — it must not replay moves into the inactive screen."""
     app = _online_app()
     app.game.variant = "local"
-    app.coordinator._begin_resync()
+    app.coordinator._begin_resync(ResyncCause.SERVER_DIRECTIVE)
 
     app.coordinator._handle_game_resumed({
         "fen": "",
@@ -752,3 +886,380 @@ def test_a_resume_snapshot_is_never_overwritten_by_stale_deltas():
         black_annotations={"sharing": True, "highlights": [], "arrows": []}))
 
     assert app.game.board.annotations.opp_arrows == []
+
+
+# ---------------------------------------------------------------------------
+# The directive the client is allowed to ignore, and the causes it must name.
+# ---------------------------------------------------------------------------
+
+
+def _directive(**payload):
+    from chessshootout.online.client import Event
+    return Event("resync_directive", payload)
+
+
+def test_a_directive_the_client_has_already_outrun_is_dropped():
+    """The directive rides back on the same socket a move broadcast does, so it
+    can arrive AFTER the update it was written about. Rebuilding the whole game
+    at that point is a pointless "Resyncing..." toast in a healthy game: the
+    client is already on the ply the server was ordering it to reach."""
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+
+    app.coordinator._handle_online_event(_directive(server_ply=0))
+
+    assert app.coordinator._resyncing is False
+    app.coordinator.client.request_state_sync.assert_not_called()
+
+
+def test_a_directive_about_a_different_ply_is_obeyed():
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+
+    app.coordinator._handle_online_event(_directive(server_ply=4))
+
+    assert app.coordinator._resyncing is True
+    app.coordinator.client.request_state_sync.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({}, id="missing_server_ply"),
+        pytest.param({"server_ply": None}, id="null_server_ply"),
+        pytest.param({"server_ply": "0"}, id="string_server_ply"),
+        pytest.param({"server_ply": 0.0}, id="float_server_ply"),
+    ],
+)
+def test_an_unreadable_directive_is_still_obeyed(payload):
+    """The drop is an optimisation, never a way to ignore the server. Anything
+    the client cannot read as a ply must fall through to the resync rather than
+    quietly comparing None against None and doing nothing."""
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+
+    app.coordinator._handle_online_event(_directive(**payload))
+
+    assert app.coordinator._resyncing is True
+
+
+def test_an_offboard_client_obeys_a_directive_about_ply_zero():
+    """The nastiest false equality the drop could produce: a client that is off
+    the board reports no ply, and a fresh game sits at ply 0. Comparing those as
+    equal would leave a genuinely stranded client refusing every order it got."""
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+    app.game.variant = "local"
+
+    app.coordinator._handle_online_event(_directive(server_ply=0))
+
+    assert app.coordinator._resyncing is True
+
+
+def test_a_repeated_directive_while_resyncing_changes_nothing(caplog):
+    """The server directive debounce is one per second, so a client whose
+    /resume is slow will be ordered again mid-repair. That must not restart the
+    self-heal timer -- doing so would let a wedged resync spin forever -- and it
+    must go by in total silence: a repair already running is not news, and a
+    stuck client would otherwise write a WARNING every second it stayed
+    stuck."""
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+    app.coordinator._handle_online_event(_directive(server_ply=4))
+    started_at = app.coordinator._resync_started_at_ms
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="chess.frontend"):
+        app.coordinator._handle_online_event(_directive(server_ply=4))
+
+    assert app.coordinator._resync_started_at_ms == started_at
+    assert app.coordinator.client.request_state_sync.call_count == 1
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def _cause_server_directive():
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+    app.coordinator._handle_online_event(_directive(server_ply=4))
+    return app
+
+
+def _cause_move_rejected():
+    from chessshootout.server.protocol import Reason
+    app = _online_app()
+    app.coordinator._handle_online_error(
+        {"reason": Reason.INVALID_MOVE_FORMAT, "msg_type": "move"})
+    return app
+
+
+def _cause_move_ply_gap():
+    app = _online_app()
+    app.coordinator._handle_remote_move_applied(
+        {"from": "e7", "to": "e5", "san": "e5", "ply": 3, "clock": {}})
+    return app
+
+
+def _cause_move_illegal():
+    app = _online_app()
+    app.coordinator._handle_remote_move_applied(
+        {"from": "e3", "to": "e4", "san": "e4", "ply": 1, "clock": {}})
+    return app
+
+
+def _cause_takeback_ply_gap():
+    from chessshootout.backend.utils import Square
+    app = _online_app()
+    app.game.match.try_move(Square(6, 4), Square(4, 4))
+    app.coordinator._handle_takeback_applied({"clock": {}, "fen": "", "ply": 5})
+    return app
+
+
+def _cause_verdict_lost():
+    from chessshootout.frontend.online_coordinator import SKILLCHECK_WATCHDOG_SLACK_MS
+    from chessshootout.skillcheck.wheel import SKILLCHECK_DEADLINE_MS
+    from tests.online.test_online_skillcheck_client import (
+        _capture_board, _online_app as _skillcheck_app, _required_payload,
+    )
+    app = _skillcheck_app()
+    app.screen = app.game
+    frm, to = _capture_board(app)
+    app.game.skillcheck_session.skillcheck_gate(frm, to)
+    app.coordinator._handle_skill_check_required(_required_payload(frm, to))
+    app.game.skillcheck_session.online_skillcheck_opened_ms = (
+        pg.time.get_ticks() - SKILLCHECK_DEADLINE_MS - SKILLCHECK_WATCHDOG_SLACK_MS - 100)
+    app.coordinator._tick_skillcheck_watchdog()
+    return app
+
+
+def _cause_result_apply_failed():
+    app = _online_app()
+
+    def _explode():
+        raise RuntimeError("the verdict could not be played out")
+
+    app.game.skillcheck_session.online_verdict_action = _explode
+    app.game.on_result({"reason": "resignation", "winner_color": "black"})
+    return app
+
+
+CAUSE_DRIVERS = {
+    ResyncCause.SERVER_DIRECTIVE: _cause_server_directive,
+    ResyncCause.MOVE_REJECTED: _cause_move_rejected,
+    ResyncCause.MOVE_PLY_GAP: _cause_move_ply_gap,
+    ResyncCause.MOVE_ILLEGAL: _cause_move_illegal,
+    ResyncCause.TAKEBACK_PLY_GAP: _cause_takeback_ply_gap,
+    ResyncCause.VERDICT_LOST: _cause_verdict_lost,
+    ResyncCause.RESULT_APPLY_FAILED: _cause_result_apply_failed,
+}
+
+
+@pytest.mark.parametrize("cause", sorted(CAUSE_DRIVERS))
+def test_every_resync_entry_point_names_itself_once(cause, caplog):
+    """A resync is only visible to us through the crash log, and "it started
+    resyncing" on its own is a support ticket with no next step. Every entry
+    point writes exactly one line naming which one it was, after the
+    idempotency guard so a repeat cannot double it."""
+    with caplog.at_level(logging.DEBUG, logger="chess.frontend"):
+        app = CAUSE_DRIVERS[cause]()
+
+    assert app.coordinator._resyncing is True
+    lines = [r for r in caplog.records if r.getMessage().startswith("resync begin")]
+    assert len(lines) == 1
+    assert lines[0].levelno == logging.WARNING
+    assert lines[0].getMessage().startswith(f"resync begin cause={cause} client_ply=")
+
+
+def test_the_cause_vocabulary_is_closed_and_fully_exercised():
+    assert set(CAUSE_DRIVERS) == _resync_cause_values()
+
+
+def _resync_cause_values():
+    return {v for k, v in vars(ResyncCause).items()
+            if not k.startswith("_") and isinstance(v, str)}
+
+
+def _begin_resync_call_causes(path):
+    """Every argument passed to a _begin_resync call in one file, as the
+    ResyncCause attribute name it names."""
+    tree = ast.parse(read_source_without_docstrings(path), filename=path)
+    causes = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name != "_begin_resync":
+            continue
+        assert len(node.args) == 1, f"{path}:{node.lineno}: _begin_resync takes one cause"
+        arg = node.args[0]
+        assert (isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name)
+                and arg.value.id == "ResyncCause"), \
+            f"{path}:{node.lineno}: the cause must be a ResyncCause member"
+        causes.append(arg.attr)
+    return causes
+
+
+def test_every_resync_call_site_names_a_real_cause():
+    """The enum is only worth having if nothing bypasses it: a bare
+    _begin_resync() or a hand-typed string would put an unsearchable line in the
+    crash log. The set has to be exhausted too -- a member nobody passes is a
+    cause we thought about and never wired."""
+    package_root = os.path.dirname(os.path.abspath(chessshootout.__file__))
+    frontend_root = os.path.join(package_root, "frontend")
+    assert os.path.isdir(frontend_root), f"guard root is wrong: {frontend_root}"
+    used, scanned = [], 0
+    for dirpath, _, filenames in os.walk(frontend_root):
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            scanned += 1
+            used.extend(_begin_resync_call_causes(os.path.join(dirpath, name)))
+    assert scanned >= 40, f"only scanned {scanned} files, guard root is likely wrong"
+    assert len(used) == 8, f"expected the eight known call sites, found {len(used)}"
+    assert {getattr(ResyncCause, name) for name in used} == _resync_cause_values()
+
+
+# ---------------------------------------------------------------------------
+# Which ply the heartbeat is allowed to claim.
+# ---------------------------------------------------------------------------
+
+
+def test_a_live_online_board_reports_its_own_ply():
+    from chessshootout.backend.utils import Square
+    app = _online_app()
+    app.game.match.try_move(Square(6, 4), Square(4, 4))
+
+    assert app.coordinator._heartbeat_ply() == 1
+
+
+def test_a_client_on_another_screen_claims_no_ply():
+    """The heartbeat keeps running from the menu, the history view and the
+    review screen. Reporting the game screen's ply from there is a claim about
+    a board nobody is looking at. Navigating for real (rather than assigning
+    app.screen) keeps the claim tied to the way a player actually leaves."""
+    app = _online_app()
+    app.switch_to("menu")
+
+    assert app.coordinator._heartbeat_ply() is None
+
+
+def test_a_local_game_claims_no_ply():
+    app = _online_app()
+    app.game.variant = "local"
+
+    assert app.coordinator._heartbeat_ply() is None
+
+
+def test_a_client_still_behind_the_match_found_card_claims_no_ply():
+    """The pairing that broke this worst: the socket is up and the heartbeat is
+    already running while the match-found card counts down, and the board behind
+    it is still the PREVIOUS game -- a mismatch of up to a whole game, every
+    single pairing and every single rematch."""
+    app = _online_app()
+    app.coordinator._pending_game_start_payload = {"your_color": "white"}
+
+    assert app.coordinator._heartbeat_ply() is None
+
+
+def test_adopting_a_resumed_game_releases_the_pairing_it_was_holding(monkeypatch, tmp_path):
+    """A pairing left pending would pin the reporter to None for the rest of the
+    session, so the server could never judge this client again. Reconnect adopts
+    a whole game without ever finishing the card, so it has to clear it."""
+    monkeypatch.setenv("CHESS_DATA_DIR", str(tmp_path))
+    app = _resumable_app()
+    app.coordinator.client.room_id = "room-1"
+    app.coordinator._pending_game_start_payload = {"your_color": "white"}
+
+    app.coordinator._adopt_resumed_game(_resumed_payload(
+        your_color="white", white_name="Alice", black_name="Bob",
+        time_minutes=5, increment_seconds=0))
+
+    assert app.coordinator._pending_game_start_payload is None
+    assert app.coordinator._heartbeat_ply() == 0, \
+        "and the heartbeat can report the board it just adopted"
+
+
+def test_no_heartbeat_is_sent_while_a_skill_check_verdict_is_pending():
+    """LOAD-BEARING: the verdict flourish plays out over several hundred ms and
+    can outlast the server's transit grace, and during it the server has already
+    applied the move while this client has not. Staying silent is what keeps
+    that window out of the server's judgement entirely."""
+    app = _online_app()
+    app.coordinator.client.state = "connected"
+    app.coordinator._last_heartbeat_sent_ms = pg.time.get_ticks() - 5000
+    app.game.skillcheck_session.online_verdict_action = lambda: None
+
+    app.coordinator._send_heartbeat_if_due()
+
+    app.coordinator.client.send_ping.assert_not_called()
+
+    app.game.skillcheck_session.online_verdict_action = None
+    app.coordinator._send_heartbeat_if_due()
+    app.coordinator.client.send_ping.assert_called_once_with(0)
+
+
+def test_the_spectator_is_silent_through_the_verdict_too():
+    """The opponent watches the check as a read-only mirror and applies the same
+    verdict action, so their window is the same shape as the mover's. Driven
+    through the real verdict the server broadcasts -- skill_check_result, which
+    only ever carries a miss -- so the flag being set is the production path's
+    doing rather than the test's."""
+    from tests.online.test_online_skillcheck_client import (
+        _capture_board, _online_app as _skillcheck_app, _result, _spectate_payload,
+    )
+    app = _skillcheck_app("black")
+    app.screen = app.game
+    frm, to = _capture_board(app)
+    app.coordinator._handle_skill_check_spectate(_spectate_payload(frm, to))
+
+    app.coordinator._handle_skill_check_result(_result(frm, to))
+
+    assert app.game.skillcheck_session.online_verdict_action is not None, \
+        "the real spectate verdict is what opens the window, not a hand-set flag"
+    app.coordinator._last_heartbeat_sent_ms = pg.time.get_ticks() - 5000
+
+    app.coordinator._send_heartbeat_if_due()
+
+    assert app.coordinator.client.pings == 0
+
+
+def test_a_rejected_quiet_move_asks_for_the_whole_state_back():
+    """The one window where this client is AHEAD of the server: it applied its
+    own quiet move locally and the server refused it. No heartbeat can catch
+    that -- the client is on a ply the server will never reach -- so the
+    rejection itself has to drive the repair."""
+    from chessshootout.server.protocol import Reason
+    app = _online_app()
+
+    app.coordinator._handle_online_error(
+        {"reason": Reason.NOT_YOUR_TURN, "msg_type": "move"})
+
+    assert app.coordinator._resyncing is True
+    app.coordinator.client.request_state_sync.assert_called_once()
+
+
+def test_a_rejected_skill_check_shot_is_not_a_desync():
+    """Scoped by msg_type on purpose: a refused skill-check input says nothing
+    about the board, and resyncing there would tear down a live check."""
+    from chessshootout.server.protocol import Reason
+    app = _online_app()
+
+    app.coordinator._handle_online_error(
+        {"reason": Reason.INVALID_MOVE_FORMAT, "msg_type": "skill_check_shot"})
+
+    assert app.coordinator._resyncing is False
+    app.coordinator.client.request_state_sync.assert_not_called()
+
+
+def test_a_takeback_refusal_still_only_toasts():
+    """not_your_turn answering a takeback request is an ordinary game-state
+    answer with its own toast, and must not be swept into the move-rejection
+    branch."""
+    from chessshootout.server.protocol import Reason
+    app = _online_app()
+
+    app.coordinator._handle_online_error(
+        {"reason": Reason.NOT_YOUR_TURN, "msg_type": "takeback_request"})
+
+    assert app.coordinator._resyncing is False
+    assert app.toast.message == "Take back is only available right after your move"

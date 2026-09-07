@@ -6,9 +6,9 @@ from chessshootout.server.protocol import (
     FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, IDLE_RESIGN_SECONDS, Reason,
 )
 from chessshootout.server.rooms import (
-    AlreadyInGameError, InvalidTokenError, NotInRoomError, QUEUE_ABANDON_SECONDS,
-    REMATCH_ABSOLUTE_CAP_SECONDS, REMATCH_IDLE_SECONDS, Room, RoomManager,
-    SharedAnnotations,
+    AlreadyInGameError, GameAlreadyStartedError, InvalidTokenError, NotInRoomError,
+    QUEUE_ABANDON_SECONDS, REMATCH_ABSOLUTE_CAP_SECONDS, REMATCH_IDLE_SECONDS, Room,
+    RoomManager, ServerFullError, SharedAnnotations,
 )
 from tests.helpers import FakeClock
 
@@ -131,6 +131,29 @@ async def test_cancel_wait_invalid_token_rejected(manager):
 async def test_cancel_wait_unknown_room_raises(manager):
     with pytest.raises(NotInRoomError):
         await manager.cancel_wait("no-such-room", session_token="anything")
+
+
+@pytest.mark.asyncio
+async def test_cancel_wait_on_a_started_game_raises_game_already_started(manager):
+    """A paired room is out of the queue, so cancelling it is not "not in room"
+    but "too late" -- its own exception, which the route answers with the
+    already_started status instead of a 404."""
+    await manager.enqueue(**_enqueue_kwargs("alice"))
+    room = await manager.enqueue(**_enqueue_kwargs("bob"))
+    assert room.is_paired()
+    with pytest.raises(GameAlreadyStartedError):
+        await manager.cancel_wait(room.room_id, session_token="tok-alice")
+
+
+@pytest.mark.parametrize("exc_type", [ServerFullError, GameAlreadyStartedError])
+def test_refusal_errors_are_not_runtime_errors(exc_type):
+    """Both used to be `RuntimeError("server_full")` / `("game_already_started")`
+    string-matched at the route. A plain Exception subclass is what makes the
+    `except` arm precise: were either one still a RuntimeError, an unrelated
+    RuntimeError raised deeper in the room manager would be caught by the same
+    arm and answered as a polite refusal."""
+    assert issubclass(exc_type, Exception)
+    assert not issubclass(exc_type, RuntimeError)
 
 
 @pytest.mark.asyncio
@@ -665,11 +688,11 @@ async def test_reaped_uuid_can_matchmake_again_cleanly(manager, clock):
 async def test_reaping_a_queued_room_frees_capacity_against_max_rooms(clock):
     """The bug that made the queue leak exploitable: `enqueue` counts queue depth
     against `_max_rooms`, so abandoned waiters permanently consumed the room
-    budget and every later matchmake got server_full."""
+    budget and every later matchmake got refused as full."""
     manager = RoomManager(now_provider=clock, max_rooms=2)
     stale = [await manager.enqueue(**_enqueue_kwargs(name, time_minutes=minutes))
              for name, minutes in (("alice", 5), ("bob", 10))]
-    with pytest.raises(RuntimeError, match="server_full"):
+    with pytest.raises(ServerFullError):
         await manager.enqueue(**_enqueue_kwargs("carl", time_minutes=15))
     clock.advance(QUEUE_ABANDON_SECONDS + 1)
     for room in manager.stale_queued_rooms():

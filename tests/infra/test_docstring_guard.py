@@ -32,6 +32,7 @@ TEST_INFRA_FILES = (
     REPO_ROOT / "tests" / "conftest.py",
     REPO_ROOT / "tests" / "server" / "conftest.py",
     REPO_ROOT / "tests" / "frontend" / "focus_helpers.py",
+    REPO_ROOT / "tests" / "online" / "online_helpers.py",
 )
 MAX_DOC_LINE_WIDTH = 92
 ALLOWED_NON_ASCII = set("→←↑↓✓✗")

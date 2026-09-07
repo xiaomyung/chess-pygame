@@ -277,6 +277,20 @@ app starts on **Official**, a source checkout on **Custom** at `localhost:8000`.
 Setting `CHESS_SERVER_ADDR` in the environment at launch wins for that run and
 bypasses the picker entirely.
 
+### Keeping the client current
+
+The server names the oldest client build it plays with. Anything older is turned
+away at matchmaking — before a game exists — so an out-of-date copy never sits
+in a search that could not have found it an opponent. Instead you get an
+**Update required** card naming both versions (the build you run and the oldest
+one the server takes), with a single **OK** that returns you to the play card. A
+server speaking a different protocol version than your build shows the same
+card.
+
+Offline play is untouched: local and bot games never contact a server. So is
+running from source — a source checkout carries no stamped version, and an
+unversioned client is always admitted.
+
 ### In-game actions
 
 - **Resign** — opponent wins.
@@ -320,8 +334,13 @@ Layered recovery:
   half-open connection is noticed even through a proxy. **Desync** is caught two
   ways: every move/takeback carries a `ply` counter, and the heartbeat reports
   the client's ply, so the server spots a player who has fallen behind and tells
-  it to `/resume`. While someone resyncs, the other player sees an amber status
-  dot and a toast.
+  it to `/resume`. A heartbeat that merely crossed a move or a takeback on the
+  wire is not a desync — for a short transit window after each change the server
+  still accepts the position the client was on just before it — and a mismatch
+  must survive two judged heartbeats before a resync is ordered. The order names
+  the ply it was written against, so a client that has already caught up to it
+  drops it instead of rebuilding for nothing. While someone resyncs, the other
+  player sees an amber status dot and a toast.
 - **Client app restart** — on next launch the client probes `POST /reclaim`;
   if the room is still alive, a **Reconnect** button appears in the start menu.
 - **Server restart** — when `/resume` fails but `/healthz` is reachable, the
@@ -345,9 +364,10 @@ the file when reporting a bug.
 
 ### Deployment
 
-See [deploy/README.md](deploy/README.md) for the containerized single-VPS setup
-— a `docker compose` edge stack (the server plus a Caddy reverse proxy that
-terminates TLS) behind Cloudflare.
+See [deploy/README.md](deploy/README.md) for the containerized single-VPS setup.
+This repo ships one `docker compose` service — the hardened `gameserver`
+container — which runs behind a standalone TLS-terminating edge proxy (its own
+stack, from its own repo) and Cloudflare in front of that.
 
 ## Development
 

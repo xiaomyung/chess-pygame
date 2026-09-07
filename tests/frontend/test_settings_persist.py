@@ -177,6 +177,26 @@ def test_missing_server_version_reads_as_a_protocol_mismatch(controller):
     assert text == "Protocol mismatch: server v? ≠ client v{}".format(PROTOCOL_VERSION)
 
 
+def test_a_health_payload_without_a_status_still_reads_as_ok(controller):
+    """The probe harnesses and any server older than the status field hand back
+    a dict with no `status` key at all. Reading it with an OK default is what
+    keeps that from rendering as a warning about nothing."""
+    kind, text = controller._describe_health(
+        {"version": PROTOCOL_VERSION, "app_version": ""}, 12)
+    assert (kind, text) == ("ok", "OK · 12 ms")
+
+
+@pytest.mark.parametrize("status", ["full", "degraded"])
+def test_a_protocol_mismatch_outranks_a_full_or_degraded_status(controller, status):
+    """Order matters: a server on another protocol cannot be played at all, so
+    that verdict has to survive whatever else the body says about load. Reading
+    the status first would replace an actionable message with a vaguer one."""
+    kind, text = controller._describe_health(
+        {"status": status, "version": PROTOCOL_VERSION - 1, "app_version": ""}, 12)
+    assert kind == "warn"
+    assert text.startswith("Protocol mismatch")
+
+
 def test_server_mode_change_notifies_the_coordinator(controller, monkeypatch):
     """A server target change must clear the coordinator's pending reclaim and
     bump its reconnect-probe generation, or the menu keeps offering a Reconnect

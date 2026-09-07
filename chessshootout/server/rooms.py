@@ -2,10 +2,10 @@ import asyncio
 import random
 import secrets
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 from uuid import uuid4
 
 from chessshootout.backend.backend import Backend
@@ -13,7 +13,7 @@ from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import Square
 from chessshootout.server.protocol import (
     GRACE_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, IDLE_WINDOW_BY_PLIES, IdleWindowSpec,
-    Reason,
+    RESYNC_STRIKE_TTL_SECONDS, Reason,
 )
 from chessshootout.skillcheck import online
 from chessshootout.skillcheck.types import SkillCheckKind, SkillCheckOutcome
@@ -25,6 +25,18 @@ REMATCH_ABSOLUTE_CAP_SECONDS = 900.0
 POST_GAME_DISCONNECT_GRACE = GRACE_SECONDS
 PAIRING_WAIT_SECONDS = 30
 QUEUE_ABANDON_SECONDS = 120.0
+HISTORY_CHANGE_WINDOW = 8
+
+
+class HistoryChange(NamedTuple):
+    """
+    One moment at which a room's move history changed, and how long it was just
+    before. The heartbeat check reads these to tell a client that is merely a
+    frame behind the news from one that has genuinely drifted
+    """
+
+    at: float
+    prev_len: int | None
 
 
 class AlreadyInGameError(Exception):
@@ -55,6 +67,26 @@ class InvalidTokenError(Exception):
     pass
 
 
+class ServerFullError(Exception):
+    """
+    Raised when the server already holds as many games and waiting players as
+    it will take, which the matchmaking route turns into a refusal asking the
+    player to try again shortly
+    """
+
+    pass
+
+
+class GameAlreadyStartedError(Exception):
+    """
+    Raised when a player tries to withdraw from a waiting place whose game has
+    meanwhile begun, which the cancel route reports as already started rather
+    than as a failure
+    """
+
+    pass
+
+
 @dataclass
 class PlayerSlot:
     """
@@ -72,8 +104,56 @@ class PlayerSlot:
     connected: bool = False
     disconnected_at: float | None = None
     desync_active: bool = False
+    ply_mismatch_streak: int = 0
+    last_strike_at: float | None = None
+    resync_logged: bool = False
     last_seen: float = 0.0
     at_result: bool = False
+
+    def strike(self, now: float) -> int:
+        """
+        Count one heartbeat that reported the wrong ply and say how many have
+        now landed in a row. Strikes expire: two that are further apart than
+        RESYNC_STRIKE_TTL_SECONDS describe two separate hiccups rather than one
+        board that is stuck, so the later one starts a fresh streak
+
+        :param now: monotonic seconds the heartbeat was judged at.
+        :returns: the streak this strike belongs to, counting itself.
+        """
+        if (self.last_strike_at is None
+                or now - self.last_strike_at > RESYNC_STRIKE_TTL_SECONDS):
+            self.ply_mismatch_streak = 1
+        else:
+            self.ply_mismatch_streak += 1
+        self.last_strike_at = now
+        return self.ply_mismatch_streak
+
+    def clear_strikes(self) -> None:
+        """
+        Spend whatever strikes stand against this seat, which is what proof of
+        a healthy board -- or an order that has just been sent -- buys. The
+        lagging spell itself is untouched, so a repair still in progress stays
+        reported as one
+        """
+        self.ply_mismatch_streak = 0
+        self.last_strike_at = None
+
+    def mark_desynced(self) -> None:
+        """
+        Note that this seat is rebuilding its game state, the flag the opponent
+        notification and the once-per-spell operator line both hang off
+        """
+        self.desync_active = True
+
+    def end_resync_spell(self) -> None:
+        """
+        Close a lagging spell: no strikes stand, the seat is no longer counted
+        as rebuilding, and the next spell may log its own operator line. Every
+        place that decides a player is caught up goes through here
+        """
+        self.clear_strikes()
+        self.desync_active = False
+        self.resync_logged = False
 
 
 @dataclass
@@ -249,6 +329,21 @@ class Room:
     idle_pushed_at: float | None = None
     annotations_white: SharedAnnotations = field(default_factory=SharedAnnotations)
     annotations_black: SharedAnnotations = field(default_factory=SharedAnnotations)
+    history_changes: deque[HistoryChange] = field(
+        default_factory=lambda: deque(maxlen=HISTORY_CHANGE_WINDOW))
+
+    def note_history_change(self, now: float, prev_len: int | None) -> None:
+        """
+        Record that the move history just changed, which is what lets a
+        heartbeat still describing the previous position be read as news in
+        flight rather than as a client that has drifted. A few of the most
+        recent changes are kept, so two quick plies cannot hide each other
+
+        :param now: monotonic seconds at which the change landed.
+        :param prev_len: how long the history was just before, or None when the
+            client's previous state is unknowable, as at a game start.
+        """
+        self.history_changes.append(HistoryChange(at=now, prev_len=prev_len))
 
     def score_for(self, color: str) -> float:
         """
@@ -507,7 +602,7 @@ class RoomManager:
             if client_uuid in self._uuid_to_room:
                 raise AlreadyInGameError()
             if len(self._active) + self.queue_depth >= self._max_rooms:
-                raise RuntimeError("server_full")
+                raise ServerFullError()
             tc = (time_minutes, increment_seconds)
             queue = self._queue[tc]
             if queue:
@@ -610,7 +705,7 @@ class RoomManager:
             room = self._find_in_queue(room_id)
             if room is None:
                 if room_id in self._active:
-                    raise RuntimeError("game_already_started")
+                    raise GameAlreadyStartedError()
                 raise NotInRoomError()
             slot = room.white or room.black
             if slot is None or slot.session_token != session_token:
@@ -696,7 +791,7 @@ class RoomManager:
         if slot is not None:
             slot.connected = True
             slot.disconnected_at = None
-            slot.desync_active = False
+            slot.end_resync_spell()
             slot.last_seen = self._now()
 
     def mark_disconnected(self, room_id: str, color: str) -> None:
@@ -991,6 +1086,7 @@ class RoomManager:
         room.plies_ever = 0
         room.annotations_white = SharedAnnotations()
         room.annotations_black = SharedAnnotations()
+        room.history_changes.clear()
         room.started_at = self._now()
         room.first_move_at = None
         room.mark_idle_activity(room.started_at)
@@ -1004,6 +1100,7 @@ class RoomManager:
         for slot in (room.white, room.black):
             if slot is not None:
                 slot.at_result = False
+                slot.end_resync_spell()
         return True
 
     @staticmethod

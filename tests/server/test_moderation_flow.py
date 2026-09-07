@@ -39,7 +39,7 @@ import time
 import pytest
 
 from chessshootout.server import handlers
-from chessshootout.server.app import PROTOCOL_VERSION, create_app
+from chessshootout.server.app import create_app
 from chessshootout.server.handlers import handle_annotation_delta, handle_annotations_state
 from chessshootout.server.moderation import detector
 from chessshootout.server.moderation.load import (
@@ -47,7 +47,8 @@ from chessshootout.server.moderation.load import (
     PLAYER_BURST_CPU_SECONDS, PLAYER_REFILL_CPU_SECONDS, ROOM_BURST_CPU_SECONDS,
     ROOM_REFILL_CPU_SECONDS, ModerationLoad,
 )
-from chessshootout.server.protocol import ANNOTATIONS_PER_SECOND, Reason
+from chessshootout.server.protocol import (
+    ANNOTATIONS_PER_SECOND, PROTOCOL_VERSION, Reason)
 from tests.helpers import FakeClock
 from tests.server import moderation_helpers as M
 from tests.server.conftest import ALICE, BOB, auth_msg

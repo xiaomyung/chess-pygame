@@ -43,18 +43,23 @@ Tests mirror the source layout, five dirs under `tests/`:
   dispatch. Flat — no `tests/frontend/board/` subdirs.
 - `tests/server/` — the `chessshootout/server/` package (FastAPI app,
   handlers, rooms, sweep, protocol — the wire models' own field bounds live in
-  `test_server_protocol.py` — and `moderation/`: the symbol detector plus its
-  library and timing pin in `test_moderation_flow.py` /
+  `test_server_protocol.py`, the heartbeat transit window and the two-strike
+  resync model in `test_server_ping_tolerance.py` — and `moderation/`: the
+  symbol detector plus its library and timing pin in `test_moderation_flow.py` /
   `test_moderation_guards.py`, including the per-room and per-player CPU meter
-  that force-stops sharing once a client outspends its budget).
+  that force-stops sharing once a client outspends its budget). The modules
+  split out of `app.py` (`limits.py`, `routes_http.py`, `ws_session.py`) kept
+  their coverage where it already was — `test_server_app.py`,
+  `test_server_validation.py`, `test_rate_limit_client_ip.py` — with the imports
+  and monkeypatch targets moved to the new homes.
 - `tests/online/` — client-side online multiplayer: the top-level
   `chessshootout/online/` package (`OnlineClient`, `ServerTransport`) plus
   `chessshootout/frontend/online_coordinator.py` and the offer banners.
 - `tests/infra/` — cross-cutting app lifecycle/config: `paths`, `env`,
   `countries`, `icons`, `log_format`, `crash_log`, `migration`, `utf8`, plus
   whole-repo static guards (`imports`, `logging_hygiene`,
-  `server_no_pygame`, `docstring_guard`) that scan the source tree rather than
-  exercise one module.
+  `server_no_pygame`, `server_layering`, `docstring_guard`) that scan the source
+  tree rather than exercise one module.
 
 **Where does a new test go?** By the primary module under test — what the
 asserts verify, not an incidental import. A file that drives a real
@@ -177,7 +182,8 @@ when it is long or reused.
 Production code follows the repo-wide docstring + annotation standard
 (CONTRIBUTING.md, "Docstrings and types"), enforced by
 `tests/infra/test_docstring_guard.py` and mypy strict in CI. The shared
-test-infra modules (`helpers.py`, the conftests, `focus_helpers.py`) follow the
+test-infra modules (`helpers.py`, the conftests, `focus_helpers.py`,
+`online_helpers.py`) follow the
 same standard; ordinary test functions need docstrings only where rationale
 lives (see above). Guards that scan source text read it through
 `helpers.read_source_without_docstrings`, so prose in docstrings can never trip
@@ -202,8 +208,15 @@ a code-shape tripwire — never scan raw file text in a new guard.
   millisecond stand-in, distinct from `helpers.FakeClock`'s server-side seconds
   clock) — import it as `from tests.frontend.focus_helpers import ...`.
 - `tests/server/conftest.py` holds the server-only `clock`/`app`/`client` fixture
-  trio, `ALICE`/`BOB`, and `auth_msg` — auto-scoped to `tests/server/` so it
-  can't shadow a client-side test's own `app`/`client` names.
+  trio, `ALICE`/`BOB`, and the shared server test doubles — `RecordingWS`,
+  `pair_room()`, the skill-check factories (`capture_room`, `fire`, `win_elapsed`,
+  `move_raw`, `shot_raw`, `seed_for`, `capture_backend`), `KV_TOKEN_RE` and
+  `assert_sweep_clean()` — plus a re-export of `helpers.auth_msg`. Auto-scoped to
+  `tests/server/` so it can't shadow a client-side test's own `app`/`client`
+  names; server test modules import shared helpers from here, never from each
+  other.
+- `tests/online/online_helpers.py` holds `wait_for` / `collect_for`, the two
+  polling waits every end-to-end online test needs.
 - `tests/server/moderation_helpers.py` is the moderation suite's own builder set
   (pattern-library readers, canonical/transformed constructions, and the
   worst-case dense-but-clean arrow store the CPU timing pin measures) — import

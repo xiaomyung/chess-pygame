@@ -1200,6 +1200,26 @@ def test_test_connection_row_reports_ok_with_latency_and_app_version(app, monkey
     assert app.settings._probe_button_label() == SERVER_PROBE_BUTTON_IDLE
 
 
+def test_test_connection_row_reports_a_full_server(app, monkeypatch):
+    """A server at its room cap answers 200 with status=full, so without this
+    branch the picker would call it OK and the player would only learn the
+    truth from a 503 on Play."""
+    _probe_harness(monkeypatch, health={
+        "status": "full", "version": PROTOCOL_VERSION, "app_version": "9.9.9"})
+    app.settings._on_test_server()
+    assert app.settings._probe_status() == ("warn", "Server full · 250 ms")
+
+
+def test_test_connection_row_reports_a_degraded_server(app, monkeypatch):
+    """Degraded means the server is answering but has fallen behind on the work
+    that ends games on time -- playable, but not something to pick over a
+    healthy one, so it reads as a warning rather than an OK."""
+    _probe_harness(monkeypatch, health={
+        "status": "degraded", "version": PROTOCOL_VERSION, "app_version": "9.9.9"})
+    app.settings._on_test_server()
+    assert app.settings._probe_status() == ("warn", "Degraded · 250 ms")
+
+
 def test_test_connection_row_reports_unreachable(app, monkeypatch):
     _probe_harness(monkeypatch, health=None)
     app.settings._on_test_server()

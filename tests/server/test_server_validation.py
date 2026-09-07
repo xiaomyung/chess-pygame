@@ -14,14 +14,16 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from chessshootout.server.app import (
-    PROTOCOL_VERSION, RECLAIM_PER_UUID_LIMIT_PER_MINUTE, UuidRateLimiter,
-    WS_CLOSE_INVALID_TOKEN, _parse_trusted_proxies, client_ip_key, create_app,
-    log_trusted_proxies,
+from chessshootout.server.app import create_app
+from chessshootout.server.limits import (
+    RECLAIM_PER_UUID_LIMIT_PER_MINUTE, UuidRateLimiter, _parse_trusted_proxies,
+    client_ip_key, log_trusted_proxies,
 )
 from chessshootout.server.protocol import (
-    CancelMatchmakeRequest, MatchmakeRequest, Reason, ReclaimRequest,
-    ResumeRequest, is_uuid4,
+    CancelMatchmakeRequest, HealthStatus, MIN_GRACE_SECONDS,
+    MIN_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_MISS_LIMIT, MatchmakeRequest,
+    PROTOCOL_VERSION, Reason, ReclaimRequest, ResumeRequest, WS_CLOSE_INVALID_TOKEN,
+    _env_float, _env_int, _read_tuning, is_uuid4,
 )
 from tests.helpers import FakeClock, fake_uuid4
 
@@ -104,34 +106,85 @@ def client(clock):
 
 
 @pytest.mark.parametrize(
-    "method, route, payload, expected_status",
+    "method, route, payload, field",
     [
         pytest.param(
             "POST", "/matchmake",
             {"version": PROTOCOL_VERSION, "client_uuid": "alice",
              "nickname": "Alice", "time_minutes": 5, "increment_seconds": 0},
-            422, id="matchmake_garbage_client_uuid",
+            "client_uuid", id="matchmake_garbage_client_uuid",
         ),
         pytest.param(
             "POST", "/resume",
             {"version": PROTOCOL_VERSION, "room_id": "not-a-uuid", "session_token": "x"},
-            422, id="resume_garbage_room_id",
+            "room_id", id="resume_garbage_room_id",
         ),
         pytest.param(
             "POST", "/reclaim",
             {"version": PROTOCOL_VERSION, "client_uuid": "u1"},
-            422, id="reclaim_garbage_client_uuid",
+            "client_uuid", id="reclaim_garbage_client_uuid",
         ),
         pytest.param(
             "DELETE", "/matchmake",
             {"version": PROTOCOL_VERSION, "room_id": "blah", "session_token": "t"},
-            422, id="cancel_matchmake_garbage_room_id",
+            "room_id", id="cancel_matchmake_garbage_room_id",
         ),
     ],
 )
-def test_route_rejects_non_uuid4_payload(client, method, route, payload, expected_status):
-    r = client.request(method, route, json=payload)
-    assert r.status_code == expected_status
+def test_route_rejects_non_uuid4_payload(client, caplog, method, route, payload, field):
+    """All four body routes answer a refused body with the same closed envelope --
+    one shared reason code, no field list, no pydantic prose. The list shape they
+    used to return was FastAPI's own default: unstable across versions, and it put
+    the failure's raw text (and, in `input`, the rejected value itself) into a
+    reply anybody can trigger. Which field failed now goes to the operator's log
+    instead, which is what the caplog half asserts."""
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        r = client.request(method, route, json=payload)
+    assert r.status_code == 422
+    assert r.json() == {"detail": {"reason": Reason.INVALID_FIELD}}
+    rejected = [rec.getMessage() for rec in caplog.records
+                if rec.getMessage().startswith("request rejected")]
+    assert len(rejected) == 1
+    assert rejected[0].startswith(
+        f"request rejected path={route} field=body.{field} error=")
+    assert str(payload.get(field, "")) not in rejected[0], \
+        "the rejected value never reaches the log"
+
+
+def test_the_published_422_matches_the_shape_the_routes_actually_send(client):
+    """/openapi.json is the contract a stranger generates a client from, and it
+    used to document FastAPI's HTTPValidationError list for a 422 the server never
+    sends. Every body route now publishes the envelope it really answers with."""
+    spec = client.get("/openapi.json").json()
+    body_routes = [("/matchmake", "post"), ("/matchmake", "delete"),
+                   ("/resume", "post"), ("/reclaim", "post")]
+    for path, method in body_routes:
+        schema = spec["paths"][path][method]["responses"]["422"]["content"]
+        ref = schema["application/json"]["schema"]["$ref"]
+        assert ref.endswith("/ReasonEnvelope"), f"{method.upper()} {path} publishes {ref}"
+    envelope = spec["components"]["schemas"]["ReasonEnvelope"]
+    assert envelope["properties"]["detail"]["$ref"].endswith("/ReasonDetail")
+    assert spec["components"]["schemas"]["ReasonDetail"]["properties"]["reason"][
+        "type"] == "string"
+
+
+def test_a_route_raised_validation_error_is_a_server_error_not_a_422(clock):
+    """The deleted `_validation_handler` caught pydantic's own ValidationError
+    app-wide. It never fired for request bodies -- FastAPI raises
+    RequestValidationError for those -- but it WOULD have dressed a server-side
+    modelling bug up as the caller's fault, with a 422 and a leaked pydantic
+    message. Uncaught, such a bug is what it actually is: a 500."""
+    app = create_app(now_provider=clock, max_rooms=8)
+
+    @app.get("/raises-a-model-error")
+    async def raises_a_model_error():
+        ResumeRequest(room_id="not-a-uuid", session_token="t")
+        return {"unreachable": True}
+
+    quiet = TestClient(app, raise_server_exceptions=False)
+    r = quiet.get("/raises-a-model-error")
+    assert r.status_code == 500
+    assert Reason.INVALID_FIELD not in r.text
 
 
 def test_ws_closes_with_invalid_token_on_garbage_room_id_path(client):
@@ -199,15 +252,17 @@ def test_uuid_rate_limiter_prunes_stale_buckets(clock):
     assert len(limiter._calls) == 0
 
 
-def test_healthz_includes_version_field(client):
+def test_healthz_includes_version_and_status_fields(client):
     body = client.get("/healthz").json()
     assert body["version"] == PROTOCOL_VERSION
+    assert body["status"] == HealthStatus.OK
 
 
 def test_healthz_includes_queue_depth_and_uptime(clock, client):
     body = client.get("/healthz").json()
     assert body["queue_depth"] == 0
     assert body["uptime_s"] == pytest.approx(0.0, abs=1e-6)
+    assert body["housekeeping_age_s"] == pytest.approx(0.0, abs=1e-6)
     clock.advance(7.5)
     body = client.get("/healthz").json()
     assert body["uptime_s"] == pytest.approx(7.5, abs=1e-3)
@@ -303,3 +358,101 @@ def test_healthz_queue_depth_reflects_pending_room(client):
     body = client.get("/healthz").json()
     assert body["queue_depth"] == 0
     assert body["rooms_active"] == 1
+
+
+TUNING_PROBE = "CHESS_TUNING_PROBE"
+
+
+@pytest.mark.parametrize(
+    "reader, default, minimum",
+    [
+        pytest.param(_env_float, 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+    ],
+)
+def test_a_missing_tuning_variable_is_the_silent_compiled_in_default(
+        monkeypatch, caplog, reader, default, minimum):
+    """Not setting a knob is the normal case -- every deployment leaves most of
+    them alone -- so it must not cost a log line."""
+    monkeypatch.delenv(TUNING_PROBE, raising=False)
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == default
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "reader, default, minimum",
+    [
+        pytest.param(_env_float, 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+    ],
+)
+def test_an_unparsable_tuning_value_falls_back_and_says_so(
+        monkeypatch, caplog, reader, default, minimum):
+    """These used to fall back in total silence, so `GRACE_SECONDS=60s` ran a
+    server on the default forever with nothing to show for it. The variable is
+    named; the value never is -- an operator-supplied string in a log line is a
+    forged-record vector."""
+    monkeypatch.setenv(TUNING_PROBE, "sixty seconds\nmatchmake ok room=forged")
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == default
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert f"name={TUNING_PROBE}" in messages[0]
+    assert f"default={default}" in messages[0]
+    assert "sixty seconds" not in messages[0]
+    assert "forged" not in messages[0]
+
+
+@pytest.mark.parametrize(
+    "reader, raw, default, minimum",
+    [
+        pytest.param(_env_float, "0", 60.0, MIN_GRACE_SECONDS, id="float"),
+        pytest.param(_env_int, "0", 3, MIN_HEARTBEAT_MISS_LIMIT, id="int"),
+        pytest.param(_env_float, "nan", 60.0, MIN_GRACE_SECONDS, id="float_nan"),
+        pytest.param(_env_float, "inf", 60.0, MIN_GRACE_SECONDS, id="float_infinity"),
+        pytest.param(_env_float, "-inf", 60.0, MIN_GRACE_SECONDS,
+                     id="float_negative_infinity"),
+    ],
+)
+def test_a_tuning_value_below_its_floor_is_clamped_and_says_so(
+        monkeypatch, caplog, reader, raw, default, minimum):
+    """SECURITY-adjacent misconfiguration: a zero heartbeat interval produced a
+    zero heartbeat timeout, which disconnects every player the moment they
+    connect. A number that would break the server is replaced by the floor
+    rather than obeyed.
+
+    nan and the infinities are the ones a bare `value < minimum` misses:
+    float() accepts all three spellings, nan compares false against every
+    bound, and +inf sails over the floor into a grace period no disconnect ever
+    ends. They are not workable settings, so they take the floor as well."""
+    monkeypatch.setenv(TUNING_PROBE, raw)
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        assert reader(TUNING_PROBE, default, minimum=minimum) == minimum
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert messages[0].startswith("env clamped")
+    assert f"name={TUNING_PROBE}" in messages[0]
+    assert f"minimum={minimum}" in messages[0]
+
+
+def test_read_tuning_clamps_every_knob_at_its_own_floor(monkeypatch, caplog):
+    """The three real variable names together, so the floors are pinned where an
+    operator actually sets them. Reading them through one function is what makes
+    this testable without reimporting the module."""
+    for name in ("GRACE_SECONDS", "HEARTBEAT_INTERVAL_SECONDS", "HEARTBEAT_MISS_LIMIT"):
+        monkeypatch.setenv(name, "0")
+    with caplog.at_level(logging.WARNING, logger="chess.server.app"):
+        grace, interval, miss_limit = _read_tuning()
+    assert (grace, interval, miss_limit) == (
+        MIN_GRACE_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_MISS_LIMIT)
+    assert interval * miss_limit > 0, "a zero heartbeat timeout is unreachable"
+    assert len(caplog.records) == 3, "one warning per clamped knob"
+
+
+def test_read_tuning_takes_an_operators_values_when_they_are_workable(monkeypatch):
+    """The point of the knobs: sane overrides still get through untouched."""
+    monkeypatch.setenv("GRACE_SECONDS", "45")
+    monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "1.5")
+    monkeypatch.setenv("HEARTBEAT_MISS_LIMIT", "5")
+    assert _read_tuning() == (45.0, 1.5, 5)

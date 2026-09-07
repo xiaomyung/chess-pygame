@@ -15,7 +15,7 @@ log = logging.getLogger("chess.client.news")
 
 CACHE_FILENAME = "news_cache.json"
 
-NEWS_MAX_ITEMS = 30
+NEWS_MAX_ITEMS = 60
 
 NEWS_TITLE_MAX_CHARS = 200
 NEWS_BODY_MAX_CHARS = 4000

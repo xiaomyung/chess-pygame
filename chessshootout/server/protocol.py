@@ -1,3 +1,4 @@
+import math
 import os
 import re
 from typing import Literal, NamedTuple
@@ -6,42 +7,106 @@ from pydantic import BaseModel, Field, field_validator
 
 from chessshootout.backend.pieces import PIECE_VALUES, PieceType
 from chessshootout.backend.utils import BOARD_SIZE
+from chessshootout.server import logging_setup
 
 
-def _env_float(name: str, default: float) -> float:
+log = logging_setup.get_logger("chess.server.app")
+
+
+MIN_GRACE_SECONDS = 1.0
+MIN_HEARTBEAT_INTERVAL_SECONDS = 0.5
+MIN_HEARTBEAT_MISS_LIMIT = 2
+TRANSIT_GRACE_CEILING_SECONDS = 1.5
+TRANSIT_GRACE_HEARTBEAT_FRACTION = 0.75
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
     """
     Read one server tuning knob out of the process environment as a float, so an
-    operator can retune timings per deployment without a rebuild. A missing or
-    unparsable value falls back to the compiled-in default instead of failing
-    startup
+    operator can retune timings per deployment without a rebuild. A value that
+    is not a number, or one below the floor that keeps the setting workable, is
+    reported and replaced rather than allowed to break the running server.
+    Infinities and nan parse as floats but are no more usable than a zero -- a
+    nan compares false against every floor -- so they take the floor too
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.
-    :returns: the parsed value, or the default.
+    :param minimum: smallest value the setting is allowed to take.
+    :returns: the parsed value, the floor, or the default.
     """
-    try:
-        return float(os.environ[name])
-    except (KeyError, ValueError):
+    raw = os.environ.get(name)
+    if raw is None:
         return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("env unparsable name=%s default=%s", name, default)
+        return default
+    if not math.isfinite(value) or value < minimum:
+        log.warning("env clamped name=%s value=%s minimum=%s", name, value, minimum)
+        return minimum
+    return value
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, *, minimum: int) -> int:
     """
     Read one server tuning knob out of the process environment as an integer,
-    the counting counterpart of the float reader. A missing or unparsable value
-    falls back to the compiled-in default instead of failing startup
+    the counting counterpart of the float reader. It reports and replaces an
+    unreadable or too-small value the same way; there is no infinity to guard
+    against here, since int() refuses those spellings outright
 
     :param name: environment variable to read.
     :param default: value used when the variable is absent or not a number.
-    :returns: the parsed value, or the default.
+    :param minimum: smallest value the setting is allowed to take.
+    :returns: the parsed value, the floor, or the default.
     """
-    try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
+    raw = os.environ.get(name)
+    if raw is None:
         return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("env unparsable name=%s default=%s", name, default)
+        return default
+    if value < minimum:
+        log.warning("env clamped name=%s value=%s minimum=%s", name, value, minimum)
+        return minimum
+    return value
 
 
-PROTOCOL_VERSION = 5
+def _read_tuning() -> tuple[float, float, int]:
+    """
+    Read the three timing knobs an operator may override at once, so the whole
+    set is resolved in one place and can be exercised without reimporting the
+    module
+
+    :returns: disconnect grace, heartbeat interval and heartbeat miss limit.
+    """
+    return (
+        _env_float("GRACE_SECONDS", 60.0, minimum=MIN_GRACE_SECONDS),
+        _env_float("HEARTBEAT_INTERVAL_SECONDS", 2.0,
+                   minimum=MIN_HEARTBEAT_INTERVAL_SECONDS),
+        _env_int("HEARTBEAT_MISS_LIMIT", 3, minimum=MIN_HEARTBEAT_MISS_LIMIT),
+    )
+
+
+def _transit_grace(interval: float) -> float:
+    """
+    Work out how long a heartbeat may still describe the position as it was
+    just before the latest change. It has to cover a round trip plus a client
+    frame, and stay strictly under one heartbeat so at most one heartbeat per
+    change is ever forgiven
+
+    :param interval: seconds between heartbeats, as the server asks for them.
+    :returns: seconds a history change keeps excusing a stale heartbeat.
+    """
+    return min(TRANSIT_GRACE_CEILING_SECONDS,
+               interval * TRANSIT_GRACE_HEARTBEAT_FRACTION)
+
+
+PROTOCOL_VERSION = 6
+MIN_CLIENT_VERSION = "2.13.0"
+CLIENT_VERSION_MAX_LEN = 32
 MAX_NICKNAME_LEN = 20
 GIVE_TIME_SECONDS = 15
 GIVE_TIME_TICK_MS = 100
@@ -53,10 +118,13 @@ MIN_TIME_MINUTES = 1
 MAX_TIME_MINUTES = 180
 MIN_INCREMENT_SECONDS = 0
 MAX_INCREMENT_SECONDS = 180
-GRACE_SECONDS = _env_float("GRACE_SECONDS", 60.0)
-HEARTBEAT_INTERVAL_SECONDS = _env_float("HEARTBEAT_INTERVAL_SECONDS", 2.0)
-HEARTBEAT_MISS_LIMIT = _env_int("HEARTBEAT_MISS_LIMIT", 3)
+GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT = _read_tuning()
 HEARTBEAT_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL_SECONDS * HEARTBEAT_MISS_LIMIT
+RESYNC_TRANSIT_GRACE_SECONDS = _transit_grace(HEARTBEAT_INTERVAL_SECONDS)
+RESYNC_STABLE_MISMATCH_HEARTBEATS = 2
+RESYNC_STRIKE_TTL_SECONDS = (
+    HEARTBEAT_INTERVAL_SECONDS * RESYNC_STABLE_MISMATCH_HEARTBEATS
+    + RESYNC_TRANSIT_GRACE_SECONDS)
 MAX_SHARED_HIGHLIGHTS = 64
 MAX_SHARED_ARROWS = 128
 CHAT_COOLDOWN_SECONDS = 3.0
@@ -66,10 +134,17 @@ MODERATION_TRIP_LIMIT = 3
 SKILLCHECK_TARGET_MAX = float(BOARD_SIZE)
 SKILLCHECK_MAX_CAPTURED_VALUE = PIECE_VALUES[PieceType.QUEEN]
 
+WS_CLOSE_PAYLOAD_TOO_LARGE = 1009
+WS_CLOSE_INVALID_TOKEN = 4000
+WS_CLOSE_SERVER_SHUTDOWN = 4002
+WS_CLOSE_SUPERSEDED = 4003
+WS_CLOSE_QUEUE_TIMEOUT = 4004
+
 UUID4_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
 )
 COORD_RE = re.compile(r"^[a-h][1-8]$")
+_CLIENT_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\Z")
 
 
 def is_uuid4(value: object) -> bool:
@@ -116,6 +191,58 @@ def _validate_coord(value: str, name: str) -> str:
     return value
 
 
+def parse_client_version(raw: object) -> tuple[int, int, int] | None:
+    """
+    Read a build version out of untrusted text as three numbers that can be
+    compared. Only plain major.minor.patch in ASCII digits is accepted, and only
+    up to a sane length, so no amount of decoration, padding or look-alike digits
+    can make an old build compare as a new one
+
+    :param raw: candidate version; anything that is not a string fails.
+    :returns: the three version numbers, or None when the text is not a version.
+    """
+    if not isinstance(raw, str) or len(raw) > CLIENT_VERSION_MAX_LEN:
+        return None
+    if not _CLIENT_VERSION_RE.match(raw):
+        return None
+    major, minor, patch = raw.split(".")
+    return (int(major), int(minor), int(patch))
+
+
+def version_text(parsed: tuple[int, int, int]) -> str:
+    """
+    Write a build version back out from the numbers it was read as, so only a
+    value that has already been parsed can ever reach a log line or a screen
+
+    :param parsed: the three version numbers.
+    :returns: the version as major.minor.patch.
+    """
+    return ".".join(str(part) for part in parsed)
+
+
+def client_version_outdated(client_version: str, minimum: str) -> bool:
+    """
+    Decide whether a build is too old to be let into a game. A build that states
+    no version at all is let through -- that is what a run from source reports,
+    and the protocol number is what turns an incompatible build away -- while one
+    that states a version nobody can read is not trusted. A minimum that cannot
+    itself be read turns nobody away, so a mistyped floor never locks the server
+
+    :param client_version: version the client stated, empty when it has none.
+    :param minimum: oldest version still accepted.
+    :returns: True when the client is older than the minimum.
+    """
+    if client_version == "":
+        return False
+    floor = parse_client_version(minimum)
+    if floor is None:
+        return False
+    mine = parse_client_version(client_version)
+    if mine is None:
+        return True
+    return mine < floor
+
+
 def _validate_coords(values: list[str]) -> list[str]:
     """
     Gate a whole set of highlighted squares in one go, the list counterpart of
@@ -138,7 +265,9 @@ class Reason:
     """
 
     VERSION_MISMATCH = "version_mismatch"
+    CLIENT_OUTDATED = "client_outdated"
     INVALID_MESSAGE = "invalid_message"
+    INVALID_FIELD = "invalid_field"
     INVALID_MOVE_FORMAT = "invalid_move_format"
     NOT_YOUR_TURN = "not_your_turn"
     SKILLCHECK_PENDING = "skillcheck_pending"
@@ -167,6 +296,31 @@ class Reason:
     ABORTED = "aborted"
     ABANDONMENT = "abandonment"
     SERVER_SHUTDOWN = "server_shutdown"
+
+
+RESULT_REASON_BY_GAME_RESULT = {
+    "white_wins": (Reason.CHECKMATE, "white"),
+    "black_wins": (Reason.CHECKMATE, "black"),
+    "white_wins_on_time": (Reason.TIMEOUT, "white"),
+    "black_wins_on_time": (Reason.TIMEOUT, "black"),
+    "draw_stalemate": (Reason.DRAW_STALEMATE, None),
+    "draw_repetition": (Reason.DRAW_REPETITION, None),
+    "draw_fifty_move": (Reason.DRAW_FIFTY_MOVE, None),
+    "draw_insufficient_material": (Reason.DRAW_INSUFFICIENT_MATERIAL, None),
+}
+
+
+class HealthStatus:
+    """
+    The closed vocabulary the health endpoint answers with: serving normally,
+    serving but with no capacity left for a new game, or still answering while
+    the routine upkeep it runs on its own has fallen behind. Client and monitor
+    compare against these constants rather than against literals
+    """
+
+    OK = "ok"
+    FULL = "full"
+    DEGRADED = "degraded"
 
 
 class IdleWindowSpec(NamedTuple):
@@ -237,6 +391,25 @@ class _Base(BaseModel):
     """
 
     version: int = PROTOCOL_VERSION
+
+
+class ReasonDetail(BaseModel):
+    """
+    Why a request was turned down, given as one code from the shared vocabulary
+    both the game and the server use, so the app can react to a refusal instead
+    of only showing it
+    """
+
+    reason: str
+
+
+class ReasonEnvelope(BaseModel):
+    """
+    The body sent back with a refused request: one detail object naming the
+    reason it was not accepted
+    """
+
+    detail: ReasonDetail
 
 
 class ClockSnapshot(BaseModel):
@@ -398,11 +571,14 @@ class MatchmakeRequest(_Base):
     """
     A player's request to be paired for an online game. Says who they are, which
     time control they want to play and which side they would prefer; they are
-    paired with an opponent asking for the same time control
+    paired with an opponent asking for the same time control. It also states
+    which build of the game they run, so a build too old for this server is
+    turned away before anyone waits for an opponent
     """
 
     nickname: str
     client_uuid: str
+    client_version: str = Field(default="", max_length=CLIENT_VERSION_MAX_LEN)
     time_minutes: int = Field(ge=MIN_TIME_MINUTES, le=MAX_TIME_MINUTES)
     increment_seconds: int = Field(ge=MIN_INCREMENT_SECONDS, le=MAX_INCREMENT_SECONDS)
     side_preference: Literal["white", "black", "random"] = "random"
@@ -573,17 +749,20 @@ class ReclaimResponse(_Base):
 
 class HealthResponse(BaseModel):
     """
-    Liveness and load summary for the server: protocol and build version, how
-    many games are running, how many players are waiting to be paired, and how
-    long the process has been up
+    Liveness and load summary for the server: whether it is serving normally,
+    out of capacity or behind on its own upkeep, the protocol and build version
+    it runs, how many games are running, how many players are waiting to be
+    paired, how long the process has been up, and how many seconds it is since
+    the last complete housekeeping pass
     """
 
-    status: str = "ok"
+    status: str = Field(default=HealthStatus.OK, max_length=32)
     version: int = PROTOCOL_VERSION
-    app_version: str = ""
+    app_version: str = Field(default="", max_length=64)
     rooms_active: int
     queue_depth: int = 0
     uptime_s: float = 0.0
+    housekeeping_age_s: float = 0.0
 
 
 class AuthMessage(_Base):
@@ -895,11 +1074,12 @@ class PingMessage(_Base):
     """
     The client's periodic heartbeat, which also reports the ply the client
     believes it is on, so a board that has fallen behind can be spotted and
-    repaired rather than drifting
+    repaired rather than drifting. A client that is not sitting on a live
+    online board reports no ply at all, and is judged on nothing
     """
 
     type: Literal["ping"] = "ping"
-    ply: int = 0
+    ply: int | None = Field(default=None, ge=0)
 
 
 class PongMessage(_Base):
@@ -914,10 +1094,13 @@ class PongMessage(_Base):
 class ResyncDirectiveMessage(_Base):
     """
     Tells a client its board has fallen behind and it should fetch the whole
-    game state again instead of patching up what it has
+    game state again instead of patching up what it has. It carries the ply the
+    server was on when it decided, so a client that has since caught up on its
+    own can recognise the order as already answered and ignore it
     """
 
     type: Literal["resync_directive"] = "resync_directive"
+    server_ply: int
 
 
 class SkillCheckRequiredMessage(_SkillCheckGeometryBase, _Base):

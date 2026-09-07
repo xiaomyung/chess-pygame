@@ -19,9 +19,10 @@ import httpx
 import pytest
 
 from chessshootout.online.transport import (
-    FatalResumeError, HEALTHZ_TIMEOUT_SECONDS, HTTP_TIMEOUT_SECONDS, NEWS_MAX_BYTES,
-    RECLAIM_TIMEOUT_SECONDS, ResponseTooLarge, SchemaVersionMismatch, ServerTransport,
-    ServerWebSocket, TransportError, TransportHTTPError, fetch_news,
+    ClientOutdated, FatalResumeError, HEALTHZ_TIMEOUT_SECONDS, HTTP_TIMEOUT_SECONDS,
+    NEWS_MAX_BYTES, RECLAIM_TIMEOUT_SECONDS, ResponseTooLarge, SchemaVersionMismatch,
+    ServerTransport, ServerWebSocket, TransportError, TransportHTTPError, _error_body,
+    _safe_error_reason, fetch_news,
 )
 from chessshootout.server.protocol import (
     HealthResponse, MatchmakeRequest, MatchmakeResponse, PROTOCOL_VERSION,
@@ -214,6 +215,124 @@ async def test_matchmake_async_http_error_status_maps_to_exception(
             await st.matchmake_async(req, http)
     if expected_status is not None:
         assert info.value.status_code == expected_status
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        pytest.param(b'{"reason": "room_full"}', {"reason": "room_full"},
+                     id="plain_reason_object_is_its_own_detail"),
+        pytest.param(b'{"detail": {"reason": "client_outdated", "min_version": "2.13.0"}}',
+                     {"reason": "client_outdated", "min_version": "2.13.0"},
+                     id="detail_object_is_unwrapped"),
+        pytest.param(b'{"detail": "Not Found"}', {"detail": "Not Found"},
+                     id="a_detail_that_is_only_a_sentence_stays_wrapped"),
+        pytest.param(b"<html>502 Bad Gateway</html>", None, id="non_json_yields_nothing"),
+        pytest.param(b"", None, id="an_empty_body_yields_nothing"),
+        pytest.param(b'["reason"]', None, id="a_json_array_is_not_an_object"),
+    ],
+)
+def test_error_body_unwraps_every_shape_a_refusal_arrives_in(content, expected):
+    """FastAPI serialises `HTTPException(detail={...})` as `{"detail": {...}}`
+    while the rate limiter answers a plain object, and anything between client
+    and server can replace the body with HTML. One reader handles all of it, so
+    the reason lookup and the min_version lookup cannot drift apart."""
+    response = httpx.Response(400, content=content)
+    assert _error_body(response) == expected
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        pytest.param(b'{"reason": "room_full"}', "room_full", id="plain_reason"),
+        pytest.param(b'{"detail": {"reason": "room_full"}}', "room_full",
+                     id="reason_under_detail"),
+        pytest.param(b'{"detail": "Not Found"}', "Not Found", id="detail_as_text"),
+        pytest.param(b"<html>502</html>", None, id="non_json"),
+        pytest.param(b'{"detail": {"note": "no reason here"}}', None,
+                     id="detail_object_without_a_reason"),
+    ],
+)
+def test_safe_error_reason_reads_the_same_four_shapes_as_before(content, expected):
+    """Pinned before `_error_body` was factored out from under it: these four
+    shapes are the whole contract every caller depends on, and the refactor had
+    to leave every one of them answering exactly as it did."""
+    assert _safe_error_reason(httpx.Response(400, content=content)) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, minimum",
+    [
+        pytest.param({"detail": {"reason": Reason.CLIENT_OUTDATED,
+                                 "min_version": "2.13.0"}}, "2.13.0",
+                     id="the_server_names_the_floor"),
+        pytest.param({"detail": {"reason": Reason.CLIENT_OUTDATED}}, "",
+                     id="a_refusal_without_a_floor_still_classifies"),
+        pytest.param({"detail": {"reason": Reason.CLIENT_OUTDATED,
+                                 "min_version": 213}}, "",
+                     id="a_floor_that_is_not_text_is_dropped"),
+    ],
+)
+async def test_a_426_naming_an_outdated_build_raises_client_outdated(body, minimum):
+    """426 plus `client_outdated` is the one refusal that can name a version to
+    update to, and the exception carries it so the card can print both numbers."""
+    transport = httpx.MockTransport(_make_handler(status_code=426, body=body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        st = ServerTransport("localhost:8000")
+        req = MatchmakeRequest(nickname="Alice", client_uuid=ALICE,
+                               time_minutes=5, increment_seconds=0)
+        with pytest.raises(ClientOutdated) as info:
+            await st.matchmake_async(req, http)
+    assert type(info.value) is ClientOutdated
+    assert isinstance(info.value, SchemaVersionMismatch)
+    assert info.value.min_version == minimum
+    assert str(info.value) == Reason.CLIENT_OUTDATED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"", id="a_body_stripped_at_the_edge"),
+        pytest.param(b"<html>426 Upgrade Required</html>", id="an_html_error_page"),
+        pytest.param(b'{"detail": {"reason": "version_mismatch"}}',
+                     id="the_protocol_refusal_itself"),
+    ],
+)
+async def test_a_426_is_classified_on_its_status_even_with_no_readable_body(content):
+    """The classification is made on the status alone, so a proxy that replaces
+    the body still lands the player on the update card instead of the generic
+    "Server unreachable" retry dialog. Without a readable `client_outdated` it
+    falls back to the protocol mismatch, which is the safe half of the pair --
+    the card words itself without a version rather than inventing one."""
+    transport = httpx.MockTransport(lambda request: httpx.Response(426, content=content))
+    async with httpx.AsyncClient(transport=transport) as http:
+        st = ServerTransport("localhost:8000")
+        req = MatchmakeRequest(nickname="Alice", client_uuid=ALICE,
+                               time_minutes=5, increment_seconds=0)
+        with pytest.raises(SchemaVersionMismatch) as info:
+            await st.matchmake_async(req, http)
+    assert type(info.value) is SchemaVersionMismatch, \
+        "no min_version was readable, so this is not the outdated-build error"
+
+
+@pytest.mark.asyncio
+async def test_the_matchmake_request_carries_whatever_client_version_it_was_given():
+    """The coordinator is the single owner of `client_version`; the transport
+    only sends the finished model. Pinned so nobody adds a second stamping site
+    here, which would make the two disagree in packaged builds."""
+    captured = []
+    transport = httpx.MockTransport(_make_handler(
+        status_code=200, body={"version": PROTOCOL_VERSION, "room_id": fake_uuid4(3),
+                               "session_token": "tok"},
+        capture=captured))
+    async with httpx.AsyncClient(transport=transport) as http:
+        st = ServerTransport("localhost:8000")
+        req = MatchmakeRequest(nickname="Alice", client_uuid=ALICE, time_minutes=5,
+                               increment_seconds=0, client_version="2.13.0")
+        await st.matchmake_async(req, http)
+    assert captured[0]["json"]["client_version"] == "2.13.0"
 
 
 @pytest.mark.asyncio

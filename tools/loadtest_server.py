@@ -65,7 +65,7 @@ async def _setup_game(transport, http, idx, minutes, increment):
     return (ws_a, ws_b) if color_a == "white" else (ws_b, ws_a)
 
 
-async def _play_game(white, black, stop, rtts):
+async def _play_game(white, black, stop, rtts, resyncs):
     pending = {white: None, black: None}
     ply = [0]
 
@@ -78,6 +78,8 @@ async def _play_game(white, black, stop, rtts):
             if msg and msg.get("type") == "pong" and pending[ws] is not None:
                 rtts.append(time.monotonic() - pending[ws])
                 pending[ws] = None
+            elif msg and msg.get("type") == "resync_directive":
+                resyncs[0] += 1
 
     async def beat(ws):
         while not stop.is_set():
@@ -112,6 +114,7 @@ async def _play_game(white, black, stop, rtts):
 async def _run(args):
     transport = ServerTransport(args.addr)
     rtts = []
+    resyncs = [0]
     stop = asyncio.Event()
     games = []
     errors = 0
@@ -119,7 +122,7 @@ async def _run(args):
         for i in range(args.rooms):
             try:
                 white, black = await _setup_game(transport, http, i, args.minutes, args.increment)
-                games.append(asyncio.create_task(_play_game(white, black, stop, rtts)))
+                games.append(asyncio.create_task(_play_game(white, black, stop, rtts, resyncs)))
             except Exception as exc:
                 errors += 1
                 if args.verbose:
@@ -140,6 +143,7 @@ async def _run(args):
         print(f"ping RTT  p50={p50 * 1000:.1f}ms  p99={p99 * 1000:.1f}ms  samples={len(rtts)}")
     else:
         print("no RTT samples collected")
+    print(f"resync directives: {resyncs[0]}")
 
 
 def main():

@@ -11,12 +11,14 @@ from typing import Any, TypeVar, cast
 from chessshootout import paths
 from chessshootout.infra import crash_log
 from chessshootout.online.transport import (
-    FatalResumeError, HEALTHZ_TIMEOUT_SECONDS, ServerTransport, ServerWebSocket,
-    TransportError, TransportHTTPError, SchemaVersionMismatch, WsConnectionClosed,
+    ClientOutdated, FatalResumeError, HEALTHZ_TIMEOUT_SECONDS, ServerTransport,
+    ServerWebSocket, TransportError, TransportHTTPError, SchemaVersionMismatch,
+    WsConnectionClosed,
 )
 from chessshootout.server.protocol import (
     CancelMatchmakeRequest, GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS,
     HEARTBEAT_MISS_LIMIT, MatchmakeRequest, Reason, ResumeRequest,
+    parse_client_version, version_text,
 )
 
 
@@ -401,13 +403,14 @@ class OnlineClient:
         """
         self._enqueue("send_give_time", hold_ms)
 
-    def send_ping(self, ply: int) -> None:
+    def send_ping(self, ply: int | None) -> None:
         """
         Send the heartbeat, stamping the moment so the reply can be turned into
         a round-trip reading. It also reports the ply this client is on, which
         is how a board that has fallen behind gets noticed
 
-        :param ply: number of half-moves this client has applied.
+        :param ply: number of half-moves this client has applied, or None while
+            it is not sitting on a live online board and has no ply to claim.
         """
         self._last_ping_sent_at = time.monotonic()
         self._enqueue("send_ping", ply)
@@ -665,9 +668,10 @@ class OnlineClient:
     async def _async_main(self, request: dict[str, Any]) -> None:
         """
         Run a session from scratch: queue for an opponent, publish the seat the
-        server handed back, then hold the socket for the whole game. A protocol
-        mismatch is reported as its own reason so the player can be told to
-        update instead of being asked to retry
+        server handed back, then hold the socket for the whole game. A build the
+        server will not take -- wrong protocol, or too old -- is reported as its
+        own reason, the outdated one carrying the version to update to, so the
+        player can be told to update instead of being asked to retry
 
         :param request: matchmaking request fields for this search.
         """
@@ -675,6 +679,15 @@ class OnlineClient:
         try:
             self.state = "connecting"
             mm = await self._matchmake_with_retries(request)
+        except ClientOutdated as exc:
+            parsed_minimum = parse_client_version(exc.min_version)
+            log.warning("client outdated min_version=%s",
+                        "unparseable" if parsed_minimum is None
+                        else version_text(parsed_minimum))
+            self._inbound.put(Event("error", {"reason": Reason.CLIENT_OUTDATED,
+                                              "min_version": exc.min_version}))
+            self.state = "disconnected"
+            return
         except SchemaVersionMismatch as exc:
             log.warning("schema version mismatch reason=%s", exc)
             self._inbound.put(Event("error", {"reason": Reason.VERSION_MISMATCH}))

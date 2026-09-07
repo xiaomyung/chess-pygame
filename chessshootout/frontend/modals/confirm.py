@@ -59,9 +59,11 @@ class ConfirmModal(BaseModal):
         :param title: the question itself, drawn large and upper-cased
         :param on_yes: run when the confirming button is clicked
         :param on_no: run when the cancelling button is clicked, or None to
-            just close the box
+            just close the box; an empty no_label leaves that button out, and
+            with it any way for this to run
         :param yes_label: text on the confirming button
-        :param no_label: text on the cancelling button
+        :param no_label: text on the cancelling button, or empty to leave that
+            button out and state the one answer there is
         :param on_extra: run by a third button, or None to leave that button
             out entirely
         :param extra_label: text on that third button
@@ -133,7 +135,8 @@ class ConfirmModal(BaseModal):
         Paint the question: the shared shell, an optional emoji tile, the
         title, the wrapped explanation and the button row, in a panel sized to
         exactly what is there. Drawing is also what fixes the button rects
-        that clicks are tested against
+        that clicks are tested against, so a button left out of the row cannot
+        be clicked either
         """
         if not self.is_visible() or self.rect.width <= 0:
             self.button_rects = {}
@@ -183,7 +186,8 @@ class ConfirmModal(BaseModal):
             y += line_h
 
         row = pg.Rect(content.x, content.bottom - btn_h, content.width, btn_h)
-        buttons = [(self.no_label, "no"), (self.yes_label, "yes")]
+        buttons = [(self.no_label, "no")] if self.no_label else []
+        buttons.append((self.yes_label, "yes"))
         if self.on_extra is not None:
             buttons.append((self.extra_label, "extra"))
         self.button_rects = draw_button_row(

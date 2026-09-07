@@ -61,6 +61,26 @@ class SchemaVersionMismatch(TransportError):
     pass
 
 
+class ClientOutdated(SchemaVersionMismatch):
+    """
+    Raised when the server understood the request perfectly and refused it
+    because this build is too old to play there. It carries the oldest version
+    that server still accepts, so the player can be told what to update to
+    rather than only that something is wrong
+    """
+
+    def __init__(self, reason: str, min_version: str = "") -> None:
+        """
+        Record the refusal reason and the oldest version the server named
+
+        :param reason: server-supplied reason code for the refusal.
+        :param min_version: oldest version that server accepts, empty when the
+            answer did not name one.
+        """
+        super().__init__(reason)
+        self.min_version = min_version
+
+
 class TransportHTTPError(TransportError):
     """
     A request the server answered with an error status. It carries the status
@@ -267,15 +287,14 @@ class _UrlBuilder:
         return f"{self.ws_scheme}://{self.host}:{self.port}{path}"
 
 
-def _safe_error_reason(response: httpx.Response) -> str | None:
+def _decoded_body(response: httpx.Response) -> dict[str, Any] | None:
     """
-    Dig the server's reason code out of an error response, accepting both the
-    plain reason field and the detail wrapper. An error body is reachable by
-    anything sitting between client and server, so anything unreadable yields
-    no reason at all and the caller falls back to naming the status
+    Decode an error response's body as the object it should be. An error body
+    is reachable by anything sitting between client and server, so a body that
+    is not JSON, or is JSON that is not an object, yields nothing at all
 
     :param response: the failed response, body not yet decoded.
-    :returns: the reason code, or None when the body carries none.
+    :returns: the decoded object, or None when the body is not one.
     """
     try:
         body = _loads(response.content)
@@ -283,14 +302,62 @@ def _safe_error_reason(response: httpx.Response) -> str | None:
         return None
     if not isinstance(body, dict):
         return None
-    if "reason" in body:
-        return cast(str, body["reason"])
+    return cast("dict[str, Any]", body)
+
+
+def _error_body(response: httpx.Response) -> dict[str, Any] | None:
+    """
+    Decode the object an error response carries its rejection details in,
+    whether the server nested them under a detail key or sent them plain, so a
+    reason and the fields beside it are read out of one and the same object
+
+    :param response: the failed response, body not yet decoded.
+    :returns: the details object, or None when the body carries none.
+    """
+    body = _decoded_body(response)
+    if body is None:
+        return None
     detail = body.get("detail")
-    if isinstance(detail, dict) and "reason" in detail:
-        return cast(str, detail["reason"])
-    if isinstance(detail, str):
-        return detail
-    return None
+    if isinstance(detail, dict):
+        return cast("dict[str, Any]", detail)
+    return body
+
+
+def _reason_from_body(body: dict[str, Any]) -> str | None:
+    """
+    Read the server's reason code out of an already decoded details object,
+    accepting both the plain reason field and a detail that is only a sentence
+
+    :param body: the details object the refusal was decoded into.
+    :returns: the reason code, or None when the object carries none.
+    """
+    reason = body.get("reason")
+    if isinstance(reason, str):
+        return reason
+    detail = body.get("detail")
+    return detail if isinstance(detail, str) else None
+
+
+def _safe_error_reason(response: httpx.Response) -> str | None:
+    """
+    Dig the server's reason code out of an error response: the reason stated at
+    the top level answers first, and only then is a nested detail looked into.
+    Anything unreadable yields no reason at all and the caller falls back to
+    naming the status
+
+    :param response: the failed response, body not yet decoded.
+    :returns: the reason code, or None when the body carries none.
+    """
+    body = _decoded_body(response)
+    if body is None:
+        return None
+    reason = body.get("reason")
+    if isinstance(reason, str):
+        return reason
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        return _reason_from_body(cast("dict[str, Any]", detail))
+    return detail if isinstance(detail, str) else None
 
 
 class ServerTransport:
@@ -443,10 +510,13 @@ class ServerTransport:
                               http: httpx.AsyncClient) -> MatchmakeResponse:
         """
         Join the matchmaking queue and take back the room and seat the server
-        assigned. A protocol mismatch is raised as its own error so the client
-        can tell the player to update, any other refusal keeps its status and
-        reason for the retry decision, and a server that cannot be reached at
-        all is reported as a transport failure the search retries through
+        assigned. A refusal that asks the player to update -- a protocol the
+        server does not speak, or a build it considers too old -- is raised as
+        its own error and decided on the status alone, so an answer stripped of
+        its body on the way here still lands on the update card. Any other
+        refusal keeps its status and reason for the retry decision, and a server
+        that cannot be reached at all is reported as a transport failure the
+        search retries through
 
         :param req: the matchmaking request, already validated.
         :param http: async client shared by this session's requests.
@@ -457,6 +527,14 @@ class ServerTransport:
             r = await http.post(url, json=req.model_dump())
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             raise TransportError(str(exc)) from exc
+        if r.status_code == 426:
+            body = _error_body(r) or {}
+            reason = _reason_from_body(body)
+            if reason != Reason.CLIENT_OUTDATED:
+                raise SchemaVersionMismatch(reason or Reason.VERSION_MISMATCH)
+            minimum = body.get("min_version")
+            raise ClientOutdated(reason,
+                                 min_version=minimum if isinstance(minimum, str) else "")
         if r.status_code >= 400:
             reason = _safe_error_reason(r) or f"http_{r.status_code}"
             if reason == Reason.VERSION_MISMATCH:
@@ -637,13 +715,14 @@ class ServerWebSocket:
         """
         await self._send(GiveTimeMessage(hold_ms=hold_ms))
 
-    async def send_ping(self, ply: int) -> None:
+    async def send_ping(self, ply: int | None) -> None:
         """
         Send the heartbeat that keeps the connection alive and reports which
         ply this client thinks it is on, which is how the server notices a
         board that has fallen behind and repairs it
 
-        :param ply: number of half-moves this client has applied.
+        :param ply: number of half-moves this client has applied, or None while
+            it is not sitting on a live online board and has no ply to claim.
         """
         await self._send(PingMessage(ply=ply))
 

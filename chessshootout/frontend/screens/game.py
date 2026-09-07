@@ -44,7 +44,9 @@ from chessshootout.frontend.focus.arrow import (
 from chessshootout.frontend.focus.time_line import TimeLine
 from chessshootout.frontend.focus.transition import FocusTransition
 from chessshootout.frontend.layout import compute_layout
-from chessshootout.frontend.online_coordinator import ONLINE_TRANSIENT_REASON_LABELS
+from chessshootout.frontend.online_coordinator import (
+    ONLINE_TRANSIENT_REASON_LABELS, ResyncCause,
+)
 from chessshootout.frontend.visual import cache
 from chessshootout.frontend.visual.colors import Colors
 from chessshootout.frontend.visual.backdrop import ArenaBackdrop
@@ -859,7 +861,8 @@ class GameScreen(Screen):
         server_ply = payload.get("ply")
         expected = len(self.match.move_history) - 1
         if server_ply is not None and server_ply != expected:
-            self.app.coordinator._begin_resync()
+            log.warning("takeback ply gap server_ply=%s expected=%d", server_ply, expected)
+            self.app.coordinator._begin_resync(ResyncCause.TAKEBACK_PLY_GAP)
             return
         self._idle_window = None
         self.board.clear_all_annotations()
@@ -1186,7 +1189,8 @@ class GameScreen(Screen):
         server_ply = payload.get("ply")
         expected = len(self.match.move_history) + 1
         if server_ply is not None and server_ply != expected:
-            self.app.coordinator._begin_resync()
+            log.warning("move ply gap server_ply=%s expected=%d", server_ply, expected)
+            self.app.coordinator._begin_resync(ResyncCause.MOVE_PLY_GAP)
             return
         self._apply_clock_snap(payload, default_to_existing=True)
         promo = payload.get("promotion")
@@ -1202,7 +1206,7 @@ class GameScreen(Screen):
                     kind, bool(payload.get("skill_check_won")),
                     payload.get("ply") or len(self.match.move_history))
         else:
-            self.app.coordinator._begin_resync()
+            self.app.coordinator._begin_resync(ResyncCause.MOVE_ILLEGAL)
 
     def on_result(self, payload: dict[str, Any]) -> None:
         """
@@ -1233,7 +1237,7 @@ class GameScreen(Screen):
             self.skillcheck_session.teardown_skillcheck_overlay()
         except Exception:
             log.exception("online result verdict/teardown failed")
-            coordinator._begin_resync()
+            coordinator._begin_resync(ResyncCause.RESULT_APPLY_FAILED)
         if reason == Reason.TIMEOUT and not self._flag_fall_played:
             self._flag_fall_played = True
             self.app.sound_manager.play_flag_fall()

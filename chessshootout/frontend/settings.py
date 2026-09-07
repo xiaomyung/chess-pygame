@@ -11,7 +11,7 @@ import pygame as pg
 from chessshootout import paths
 from chessshootout.infra import env
 from chessshootout.online.client import probe_server_health
-from chessshootout.server.protocol import PROTOCOL_VERSION
+from chessshootout.server.protocol import HealthStatus, PROTOCOL_VERSION
 from chessshootout.frontend.game.variant import Variant
 from chessshootout.frontend.menu.options_rows import (
     ActionRow, PathRow, RevealRow, TextRow, ToggleRow, NotchRow, SegmentedRow,
@@ -190,8 +190,8 @@ class SettingsController:
         """
         Turn a server's health answer into the one-line verdict the Options
         row shows: unreachable, a protocol mismatch that would make playing
-        there impossible, or an OK line with the round trip and the version
-        the server is running
+        there impossible, a server that is full or behind on its own upkeep,
+        or an OK line with the round trip and the version the server is running
 
         :param health: health summary the server sent back, or None when it
             never answered
@@ -205,6 +205,11 @@ class SettingsController:
             seen = "?" if version is None else version
             return (TONE_WARN,
                     f"Protocol mismatch: server v{seen} ≠ client v{PROTOCOL_VERSION}")
+        status = health.get("status", HealthStatus.OK)
+        if status == HealthStatus.FULL:
+            return (TONE_WARN, f"Server full · {latency_ms} ms")
+        if status == HealthStatus.DEGRADED:
+            return (TONE_WARN, f"Degraded · {latency_ms} ms")
         app_version = health.get("app_version") or ""
         suffix = f" · v{app_version}" if app_version else ""
         return (TONE_OK, f"OK · {latency_ms} ms{suffix}")

@@ -55,11 +55,12 @@ def attach_rotating_file_handler(
     return handler
 
 
-def get_logger(name: str = "chess.server") -> logging.Logger:
+def get_logger(name: str) -> logging.Logger:
     """
     Give the named logger that server code writes through, instead of every
-    module reaching for the logging package itself. The server modules all ask
-    for the same name, which keeps their output under one readable prefix
+    module reaching for the logging package itself. The name is always spelled
+    out at the call site: the server modules all ask for the same one, which
+    keeps their output under a single readable prefix
 
     :param name: dotted logger name, e.g. chess.server.app
     :returns: the standard library logger for that name

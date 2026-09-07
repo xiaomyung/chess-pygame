@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pygame as pg
 
+from chessshootout import paths
 from chessshootout.backend.utils import Square, coord_from_square, square_from_coord
 from chessshootout.domain.pgn.load import time_category_for_minutes
 from chessshootout.frontend.modals.match_found import MatchFoundModal
@@ -21,7 +22,8 @@ from chessshootout.online.client import (
     probe_active_game,
 )
 from chessshootout.server.protocol import (
-    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, Reason,
+    FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, PROTOCOL_VERSION, Reason,
+    parse_client_version, version_text,
 )
 from chessshootout.skillcheck.wheel import SKILLCHECK_DEADLINE_MS
 
@@ -58,6 +60,7 @@ ONLINE_HARD_FAILURE_LABELS = {
     ClientReason.SERVER_UNREACHABLE: "Server unreachable",
     ClientReason.RECONNECT_FAILED: "Could not reconnect",
     Reason.ROOM_FULL: "Server is full",
+    Reason.INVALID_FIELD: "Request rejected by server",
 }
 
 ONLINE_HARD_FAILURE_REASONS = frozenset(ONLINE_HARD_FAILURE_LABELS)
@@ -73,19 +76,46 @@ ONLINE_TRANSIENT_REASON_LABELS = {
     Reason.OPP_HIDES_MARKS: "Opponent hides shared marks",
 }
 
-ONLINE_GAME_STATE_REASONS = {
+ONLINE_GAME_STATE_REASONS = frozenset({
     Reason.NOT_YOUR_TURN, Reason.INVALID_MOVE_FORMAT, Reason.INVALID_MESSAGE,
-    Reason.VERSION_MISMATCH,
-}
+})
 
-MOVE_REJECTION_REASONS = {
+UPDATE_REQUIRED_REASONS = frozenset({Reason.CLIENT_OUTDATED, Reason.VERSION_MISMATCH})
+
+UPDATE_REQUIRED_TITLE = "Update required"
+UPDATE_REQUIRED_BUTTON = "OK"
+UPDATE_REQUIRED_UNKNOWN_SUB = "This server needs a newer build — update your install"
+UPDATE_REQUIRED_PROTOCOL_SUB = (
+    "This server and this build speak different versions "
+    f"(server v?, client v{PROTOCOL_VERSION}) — update your install"
+)
+
+MOVE_REJECTION_REASONS = frozenset({
     Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN, Reason.SKILLCHECK_PENDING,
     Reason.MOVE_LOCKED,
-}
+})
+
+MOVE_RESYNC_REASONS = frozenset({Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN})
 
 NOT_YOUR_TURN_TOASTS = {
     "takeback_request": "Take back is only available right after your move",
 }
+
+
+class ResyncCause:
+    """
+    The closed set of reasons this client rebuilds a game from the server. Every
+    resync names one, so the crash log says what actually went wrong instead of
+    only that something did
+    """
+
+    SERVER_DIRECTIVE = "server_directive"
+    MOVE_REJECTED = "move_rejected"
+    MOVE_PLY_GAP = "move_ply_gap"
+    MOVE_ILLEGAL = "move_illegal"
+    TAKEBACK_PLY_GAP = "takeback_ply_gap"
+    VERDICT_LOST = "verdict_lost"
+    RESULT_APPLY_FAILED = "result_apply_failed"
 
 
 class OnlineCoordinator:
@@ -431,7 +461,7 @@ class OnlineCoordinator:
         elif event.type == "idle_window":
             self._handle_idle_window(event.payload)
         elif event.type == "resync_directive":
-            self._begin_resync()
+            self._handle_resync_directive(event.payload)
         elif event.type == "skill_check_required":
             self._handle_skill_check_required(event.payload)
         elif event.type == "skill_check_result":
@@ -443,11 +473,40 @@ class OnlineCoordinator:
         elif event.type == "error":
             self._handle_online_error(event.payload)
 
+    def _handle_resync_directive(self, payload: dict[str, Any]) -> None:
+        """
+        Obey the server's order to rebuild the game, unless a rebuild is
+        already under way or this client has already caught up to the very ply
+        the order was written against -- an order the network delayed past its
+        own answer. Anything unreadable in the payload is treated as an order
+        worth obeying, and named only by its type, so a server sending text
+        where a ply belongs cannot put that text in the log
+
+        :param payload: resync-directive message, carrying the ply the server
+            was on when it decided
+        """
+        if self._resyncing:
+            return
+        server_ply = payload.get("server_ply")
+        if isinstance(server_ply, int):
+            client_ply = self._heartbeat_ply()
+            if client_ply is not None and server_ply == client_ply:
+                log.debug("resync directive server_ply=%d stale=True", server_ply)
+                return
+            log.warning("resync directive server_ply=%d", server_ply)
+        else:
+            log.warning("resync directive server_ply_type=%s",
+                        type(server_ply).__name__)
+        self._begin_resync(ResyncCause.SERVER_DIRECTIVE)
+
     def _handle_online_error(self, payload: dict[str, Any]) -> None:
         """
         Decide what a rejection or failure from the server should look like to
         the player: silence for ordinary game-state answers, a toast for
-        transient ones, a confirm dialog with Retry for the hard failures. A
+        transient ones, a one-button update card for a build the server will
+        not take, and a confirm dialog with Retry for the hard failures. A move
+        the server refused as illegal or out of turn also rebuilds the game from
+        the server, since the two boards plainly disagree about the position. A
         reason string the server supplied is truncated before it reaches a toast
 
         :param payload: error message, keyed by reason plus the message type it
@@ -461,8 +520,11 @@ class OnlineCoordinator:
         if pending_move is not None and reason in MOVE_REJECTION_REASONS:
             game.skillcheck_session.pending_online_move = None
             game.board.selected_square = None
-            if reason in (Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN):
-                self._begin_resync()
+            if reason in MOVE_RESYNC_REASONS:
+                self._begin_resync(ResyncCause.MOVE_REJECTED)
+            return
+        if reason in MOVE_RESYNC_REASONS and payload.get("msg_type") == "move":
+            self._begin_resync(ResyncCause.MOVE_REJECTED)
             return
         if reason == Reason.NOT_YOUR_TURN:
             label = NOT_YOUR_TURN_TOASTS.get(cast(str, payload.get("msg_type")))
@@ -493,12 +555,19 @@ class OnlineCoordinator:
             self._on_online_cancel()
             self.app.toast.show(ONLINE_TRANSIENT_REASON_LABELS[reason])
             return
+        if reason in UPDATE_REQUIRED_REASONS:
+            log.warning("online update required reason=%s", reason)
+            self._dismiss_pairing_ui()
+            self.app.confirm_modal.show(
+                UPDATE_REQUIRED_TITLE,
+                on_yes=self._on_online_cancel,
+                yes_label=UPDATE_REQUIRED_BUTTON, no_label="",
+                sub=self._update_required_sub(reason, payload),
+            )
+            return
         if reason in ONLINE_HARD_FAILURE_REASONS or reason.startswith("http_"):
             log.warning("online hard failure reason=%s", reason)
-            self._end_resync(replay=False)
-            self.wait_modal.hide()
-            self.match_found_modal.hide()
-            self.offer_banners.clear()
+            self._dismiss_pairing_ui()
             label = ONLINE_HARD_FAILURE_LABELS.get(
                 reason, ONLINE_HARD_FAILURE_LABELS[ClientReason.SERVER_UNREACHABLE])
             self.app.confirm_modal.show(
@@ -514,6 +583,39 @@ class OnlineCoordinator:
             self.app.toast.show(label)
         else:
             self.app.toast.show("Server error")
+
+    def _dismiss_pairing_ui(self) -> None:
+        """
+        Clear everything a search or a game had on screen before a dialog takes
+        over: any rebuild in progress, both pairing cards and the offer banners.
+        Shared by the refusals that end with a confirm dialog of their own
+        """
+        self._end_resync(replay=False)
+        self.wait_modal.hide()
+        self.match_found_modal.hide()
+        self.offer_banners.clear()
+
+    def _update_required_sub(self, reason: str, payload: dict[str, Any]) -> str:
+        """
+        Word the update card for the refusal that was actually hit: an outdated
+        build names both versions, a protocol the server does not speak names
+        what this build speaks. Every number is written back out of a parsed
+        value, so a server answering with text where a version belongs cannot
+        put that text on the player's screen
+
+        :param reason: the refusal code, an outdated build or a protocol gap
+        :param payload: the error event, which may name the oldest build the
+            server still accepts
+        :returns: the explanation drawn under the title
+        """
+        if reason != Reason.CLIENT_OUTDATED:
+            return UPDATE_REQUIRED_PROTOCOL_SUB
+        mine = parse_client_version(paths.get_app_version())
+        minimum = parse_client_version(payload.get("min_version"))
+        if mine is None or minimum is None:
+            return UPDATE_REQUIRED_UNKNOWN_SUB
+        return (f"You run v{version_text(mine)} · this server needs "
+                f"v{version_text(minimum)} or newer — update your install")
 
     def _opp_name(self) -> str:
         """
@@ -676,14 +778,19 @@ class OnlineCoordinator:
             on_yes=respond(True), on_no=respond(False),
         )
 
-    def _begin_resync(self) -> None:
+    def _begin_resync(self, cause: str) -> None:
         """
         Start rebuilding the whole game from the server after a suspected
         desync, asking for a fresh snapshot and holding board events back until
-        it lands. Asking again while one is already running does nothing
+        it lands. Asking again while one is already running does nothing, so the
+        one line it writes marks the start of a repair, not every attempt
+
+        :param cause: which ResyncCause member sent us here
         """
         if self._resyncing:
             return
+        log.warning("resync begin cause=%s client_ply=%d",
+                    cause, len(self.app.game.match.move_history))
         self._resyncing = True
         self.offer_banners.clear()
         self._resync_started_at_ms = pg.time.get_ticks()
@@ -1033,6 +1140,7 @@ class OnlineCoordinator:
         request = {
             "nickname": (config.get("nickname") or "").strip() or "Player",
             "client_uuid": env.get_or_create_client_uuid(),
+            "client_version": paths.get_app_version(),
             "time_minutes": config["time_minutes"] or ONLINE_DEFAULT_TIME_MINUTES,
             "increment_seconds": config["increment_seconds"],
             "side_preference": config["side"],
@@ -1237,12 +1345,31 @@ class OnlineCoordinator:
             game._local_disconnected_at_ms = None
         self._prev_online_state = current
 
+    def _heartbeat_ply(self) -> int | None:
+        """
+        Work out which ply this client can honestly claim to be showing. Only a
+        live online board that is actually on screen and not still behind the
+        match-found card has one; anywhere else the heartbeat claims nothing, so
+        the server judges nothing
+
+        :returns: half-moves applied on the online board, or None when this
+            client is not sitting on one
+        """
+        game = self.app.game
+        if (self.app.screen is not game or game.variant != Variant.ONLINE
+                or self._pending_game_start_payload is not None):
+            return None
+        return len(game.match.move_history)
+
     def _send_heartbeat_if_due(self) -> None:
         """
         Keep the connection alive on the interval the server asked for, and
-        carry this client's ply count in every ping so the server can notice a
-        client lagging behind and answer with a resync directive, debounced on
-        its side. A server that has gone silent is escalated to a reconnect
+        carry the ply this client is honestly on in every ping so the server can
+        notice a board lagging behind and answer with a resync directive,
+        debounced on its side. Nothing is sent while a skill-check verdict is
+        still to be applied, since that window is exactly when the two sides
+        legitimately disagree. A server that has gone silent is escalated to a
+        reconnect
         """
         if self.client is None or not self.client.is_connected():
             return
@@ -1256,7 +1383,7 @@ class OnlineCoordinator:
         now = pg.time.get_ticks()
         if now - self._last_heartbeat_sent_ms >= self.client.heartbeat_interval() * 1000:
             self._last_heartbeat_sent_ms = now
-            self.client.send_ping(len(game.match.move_history))
+            self.client.send_ping(self._heartbeat_ply())
 
     def _update_heartbeat(self) -> None:
         """
@@ -1328,9 +1455,8 @@ class OnlineCoordinator:
             return
         elapsed = pg.time.get_ticks() - session.online_skillcheck_opened_ms
         if elapsed > SKILLCHECK_DEADLINE_MS + SKILLCHECK_WATCHDOG_SLACK_MS:
-            log.warning("skillcheck verdict lost; resyncing")
             session.teardown_skillcheck_overlay()
-            self._begin_resync()
+            self._begin_resync(ResyncCause.VERDICT_LOST)
 
     def _update_online_phase(self) -> None:
         """
@@ -1516,10 +1642,13 @@ class OnlineCoordinator:
         """
         Rebuild a whole game out of a server snapshot -- menu settings, board,
         clocks, marks and any pending skill check -- as one step, so a half
-        restored game can never be left on screen
+        restored game can never be left on screen. Whatever the search still had
+        on screen or was holding back goes with it, since the snapshot is now
+        the board this client is on
 
         :param resume: resume snapshot fetched from the server
         """
+        self._clear_search_state()
         self.app.menu.apply_resume_config(resume)
         self._start_online_game(resume)
         self._handle_game_resumed(resume)

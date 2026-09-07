@@ -1,9 +1,17 @@
-"""Idle-window choreography through the real dispatch choke point.
+"""Idle-window choreography through the real dispatch choke point, plus the
+offer-response handlers' outcome vocabulary.
 
 Every allowlisted message runs _touch_idle_window AFTER its handler, so the
 handler's arm/disarm (a landed ply) and finalize (a resign) are what the touch
 re-validates against. Two guards carry the whole policy: only the RESIGNATION
 window ever resets on activity, and only the side on the hook can reset it.
+
+handle_draw_response and handle_takeback_response answer with a short outcome
+word that leaves the server only through the dispatch DEBUG line -- nothing else
+in the suite reads them, so the words themselves and the ORDER of the guards that
+pick them are pinned here. The order is load-bearing in one place: a takeback
+response is refused while a skill check is held BEFORE the frame is parsed, while
+a draw response has no pending guard at all and parses first.
 """
 import json
 
@@ -15,17 +23,14 @@ from chessshootout.server.handlers import HANDLERS, IDLE_ACTIVITY_TYPES, dispatc
 from chessshootout.server.protocol import (
     FIRST_MOVE_ABORT_SECONDS, IDLE_RESIGN_SECONDS, PROTOCOL_VERSION, Reason,
 )
-from tests.server.conftest import ALICE, BOB
-from tests.server.test_server_broadcasts import RecordingWS
+from chessshootout.server.rooms import PendingSkillCheck
+from chessshootout.skillcheck.types import SkillCheckKind
+from tests.server.conftest import RecordingWS, pair_room
 
 
 async def _wired_room(app):
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms)
     ws_w, ws_b = RecordingWS(), RecordingWS()
     app.state.connections.add(room.room_id, room.white.client_uuid, ws_w)
     app.state.connections.add(room.room_id, room.black.client_uuid, ws_b)
@@ -309,3 +314,170 @@ async def test_a_rejected_move_by_the_side_to_move_still_refreshes(app, clock):
     assert room.idle_since == clock()
     assert ws_w.of_type("idle_window")[-1]["seconds_remaining"] == pytest.approx(
         IDLE_RESIGN_SECONDS)
+
+
+SKILLCHECK_HOLD_MS = 5000.0
+
+
+def _arm_pending_check(room, clock):
+    """A held capture, built straight onto the room. Both ordering tests below
+    care only THAT a check is pending, and driving a real capture would need a
+    brute-forced room secret (see test_server_skillcheck.py) for no extra signal
+    about the guard order."""
+    now_ms = clock() * 1000.0
+    room.pending_skillcheck = PendingSkillCheck(
+        color="white", from_sq=square_from_coord("e4"), to_sq=square_from_coord("d5"),
+        promotion=None, kind=SkillCheckKind.WHEEL, seed="0" * 32, value_diff=0,
+        start_ms=now_ms, expires_at_ms=now_ms + SKILLCHECK_HOLD_MS,
+    )
+    return room.pending_skillcheck
+
+
+async def test_a_draw_response_without_a_standing_offer_is_a_noop(app, clock):
+    room, ws_w, ws_b = await _wired_room(app)
+
+    _, outcome = await dispatch(app, ws_w, room, "white",
+                                _msg(type="draw_response", accept=True))
+
+    assert outcome == "noop"
+    assert room.result is None, "an unsolicited acceptance cannot end a game"
+
+
+async def test_a_draw_response_after_the_game_ended_is_a_noop(app, clock):
+    """The offer stood when the game ended, so draw_offered_by alone is not
+    enough — the result guard has to come first or a late acceptance would race
+    a landed result."""
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_w, room, "white", _msg(type="draw_offer"))
+    await dispatch(app, ws_w, room, "white", _msg(type="resign"))
+
+    _, outcome = await dispatch(app, ws_b, room, "black",
+                                _msg(type="draw_response", accept=True))
+
+    assert outcome == "noop"
+    assert room.result == (Reason.RESIGNATION, "black"), "the resignation stands"
+
+
+async def test_answering_your_own_draw_offer_is_refused_as_self(app, clock):
+    room, ws_w, ws_b = await _wired_room(app)
+    await dispatch(app, ws_w, room, "white", _msg(type="draw_offer"))
+
+    _, outcome = await dispatch(app, ws_w, room, "white",
+                                _msg(type="draw_response", accept=True))
+
+    assert outcome == "self"
+    assert room.result is None, "nobody may agree a draw with themselves"
+    assert room.draw_offered_by == "white", "the offer is left standing for the opponent"
+
+
+async def test_an_accepted_draw_ends_the_game_by_agreement(app, clock):
+    room, ws_w, ws_b = await _wired_room(app)
+    await dispatch(app, ws_w, room, "white", _msg(type="draw_offer"))
+
+    _, outcome = await dispatch(app, ws_b, room, "black",
+                                _msg(type="draw_response", accept=True))
+
+    assert outcome == "accepted"
+    assert room.result == (Reason.DRAW_AGREEMENT, None)
+
+
+async def test_a_declined_draw_clears_the_offer_and_plays_on(app, clock):
+    room, ws_w, ws_b = await _wired_room(app)
+    await dispatch(app, ws_w, room, "white", _msg(type="draw_offer"))
+
+    _, outcome = await dispatch(app, ws_b, room, "black",
+                                _msg(type="draw_response", accept=False))
+
+    assert outcome == "declined"
+    assert room.draw_offered_by is None, "a decline clears the offer"
+    assert room.result is None
+
+
+async def test_a_takeback_response_without_a_standing_request_is_a_noop(app, clock):
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+
+    _, outcome = await dispatch(app, ws_w, room, "white",
+                                _msg(type="takeback_response", accept=True))
+
+    assert outcome == "noop"
+    assert len(room.backend.move_history) == 2, "no request, no rewind"
+
+
+async def test_answering_your_own_takeback_request_is_refused_as_self(app, clock):
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="takeback_request"))
+
+    _, outcome = await dispatch(app, ws_b, room, "black",
+                                _msg(type="takeback_response", accept=True))
+
+    assert outcome == "self"
+    assert len(room.backend.move_history) == 2
+    assert room.takeback_offered_by == "black", "the request is left for the opponent"
+
+
+async def test_a_malformed_takeback_response_is_refused_as_invalid(app, clock):
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="takeback_request"))
+
+    _, outcome = await dispatch(app, ws_w, room, "white", _msg(type="takeback_response"))
+
+    assert outcome == "invalid", "`accept` is required; a frame without it decides nothing"
+    assert room.takeback_offered_by == "black"
+    assert len(room.backend.move_history) == 2
+
+
+async def test_an_accepted_takeback_reports_accepted(app, clock):
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="takeback_request"))
+
+    _, outcome = await dispatch(app, ws_w, room, "white",
+                                _msg(type="takeback_response", accept=True))
+
+    assert outcome == "accepted"
+    assert len(room.backend.move_history) == 1
+    assert room.takeback_offered_by is None
+
+
+async def test_a_declined_takeback_reports_declined_and_keeps_the_position(app, clock):
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="takeback_request"))
+
+    _, outcome = await dispatch(app, ws_w, room, "white",
+                                _msg(type="takeback_response", accept=False))
+
+    assert outcome == "declined"
+    assert len(room.backend.move_history) == 2
+    assert room.takeback_offered_by is None
+
+
+async def test_a_takeback_response_checks_the_held_check_before_it_parses(app, clock):
+    """ORDERING: the pending-skill-check guard sits ABOVE the parse. The frame
+    below has no `accept` field, so it would parse-fail to `invalid` if the guard
+    had been moved below the try/except — same refusal to the player either way,
+    but the wrong one would mean the parser is reachable while a capture is held,
+    and the accept branch (backend.undo()) sits directly behind it."""
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="takeback_request"))
+    _arm_pending_check(room, clock)
+
+    _, outcome = await dispatch(app, ws_w, room, "white", _msg(type="takeback_response"))
+
+    assert outcome == "pending"
+    assert room.takeback_offered_by == "black", "the request survives the refusal"
+    assert len(room.backend.move_history) == 2
+
+
+async def test_a_draw_response_during_a_held_check_still_parses_first(app, clock):
+    """The negative control for the ordering test above: handle_draw_response has
+    NO pending guard, so the identical malformed frame reaches the parser and
+    comes back `invalid`. Agreeing a draw while a capture is held is legal — the
+    finalize clears the pending check itself."""
+    room, ws_w, ws_b = await _room_at_ply_two(app)
+    await dispatch(app, ws_b, room, "black", _msg(type="draw_offer"))
+    _arm_pending_check(room, clock)
+
+    _, outcome = await dispatch(app, ws_w, room, "white", _msg(type="draw_response"))
+
+    assert outcome == "invalid"
+    assert room.draw_offered_by == "black", "the offer survives the refusal"
+    assert room.pending_skillcheck is not None, "and the held check is untouched"

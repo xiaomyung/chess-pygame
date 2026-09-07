@@ -7,16 +7,16 @@ test_share_chat_client.py cannot reach: opponent-only relay, aliased arrow keys
 on the wire, the server-side mark wipe on a move (no frame emitted), the
 annotations carried by /resume, the 3s chat cooldown, and the post-result noop.
 
-Structure/timeouts mirror test_online_flow.py (its `_wait_for` is reused by
-import). Exactly one real-clock sleep lives in this file: the chat cooldown is
-enforced against the server's real monotonic clock (the fixture builds the app
-with the default now_provider and exposes no override), so the cooldown test
-sleeps ~3.1s to cross the 3.0s window."""
+Structure/timeouts mirror test_online_flow.py (the polling helpers are shared
+via tests/online/online_helpers.py). Exactly one real-clock sleep lives in this
+file: the chat cooldown is enforced against the server's real monotonic clock
+(the fixture builds the app with the default now_provider and exposes no
+override), so the cooldown test sleeps ~3.1s to cross the 3.0s window."""
 import time
 
 from chessshootout.online.client import OnlineClient, fetch_resume
 from tests.helpers import fake_uuid4
-from tests.online.test_online_flow import _wait_for
+from tests.online.online_helpers import collect_for, wait_for
 
 
 ANNO_WHITE = fake_uuid4(21)
@@ -39,22 +39,9 @@ def _pair(server, white_uuid, black_uuid):
     b.connect(addr, {"nickname": "Bob", "client_uuid": black_uuid,
                      "time_minutes": 5, "increment_seconds": 0,
                      "side_preference": "black"})
-    assert _wait_for(a, "game_start").payload["your_color"] == "white"
-    assert _wait_for(b, "game_start").payload["your_color"] == "black"
+    assert wait_for(a, "game_start").payload["your_color"] == "white"
+    assert wait_for(b, "game_start").payload["your_color"] == "black"
     return addr, a, b
-
-
-def _collect_for(client, timeout):
-    """Drain a client's inbound queue for a fixed window, returning every event
-    seen. Used for absence assertions where nothing should arrive (unlike
-    _wait_for, which discards the events it steps past)."""
-    deadline = time.time() + timeout
-    seen = []
-    while time.time() < deadline:
-        seen.extend(client.drain_inbound())
-        time.sleep(0.05)
-    seen.extend(client.drain_inbound())
-    return seen
 
 
 def test_shared_annotations_relay_state_sync_and_move_wipe(server):
@@ -67,22 +54,22 @@ def test_shared_annotations_relay_state_sync_and_move_wipe(server):
     addr, a, b = _pair(server, ANNO_WHITE, ANNO_BLACK)
 
     a.send_annotations_state(True, ["e4"], [("g1", "f3")])
-    state_ev = _wait_for(b, "annotations_state")
+    state_ev = wait_for(b, "annotations_state")
     assert state_ev is not None
     assert state_ev.payload["sharing"] is True
     assert state_ev.payload["highlights"] == ["e4"]
     assert state_ev.payload["arrows"] == [{"from": "g1", "to": "f3"}]
 
     a.send_annotation_delta("add", "highlight", square="d4")
-    delta_ev = _wait_for(b, "annotation_delta")
+    delta_ev = wait_for(b, "annotation_delta")
     assert delta_ev is not None
     assert delta_ev.payload["action"] == "add"
     assert delta_ev.payload["kind"] == "highlight"
     assert delta_ev.payload["square"] == "d4"
 
     a.send_move("e2", "e4")
-    assert _wait_for(a, "move_applied") is not None
-    b_after_move = _collect_for(b, 1.0)
+    assert wait_for(a, "move_applied") is not None
+    b_after_move = collect_for(b, 1.0)
     types = [ev.type for ev in b_after_move]
     assert "move_applied" in types
     assert "annotations_state" not in types
@@ -96,14 +83,14 @@ def test_shared_annotations_relay_state_sync_and_move_wipe(server):
     assert white_store["arrows"] == []
 
     a.send_annotations_state(False, [], [])
-    stop_ev = _wait_for(b, "annotations_state")
+    stop_ev = wait_for(b, "annotations_state")
     assert stop_ev is not None
     assert stop_ev.payload["sharing"] is False
     assert stop_ev.payload["highlights"] == []
     assert stop_ev.payload["arrows"] == []
 
     a.send_annotations_state(True, ["d4"], [("b1", "c3")])
-    reshared = _wait_for(b, "annotations_state")
+    reshared = wait_for(b, "annotations_state")
     assert reshared is not None
     assert reshared.payload["arrows"] == [{"from": "b1", "to": "c3"}]
     resumed_full = fetch_resume(addr, b.room_id, b._session_token)
@@ -124,22 +111,22 @@ def test_quick_chat_relay_and_cooldown(server):
     _addr, a, b = _pair(server, CHAT_WHITE, CHAT_BLACK)
 
     a.send_quick_chat(1)
-    chat_ev = _wait_for(b, "quick_chat_received")
+    chat_ev = wait_for(b, "quick_chat_received")
     assert chat_ev is not None
     assert chat_ev.payload["preset"] == 1
     assert chat_ev.payload["sender"] == "white"
 
     a.send_quick_chat(2)
-    err = _wait_for(a, "error")
+    err = wait_for(a, "error")
     assert err is not None
     assert err.payload["reason"] == "rate_limited"
     assert err.payload.get("msg_type") == "quick_chat"
-    throttled = _collect_for(b, 1.0)
+    throttled = collect_for(b, 1.0)
     assert not any(ev.type == "quick_chat_received" for ev in throttled)
 
     time.sleep(3.1)
     a.send_quick_chat(3)
-    chat_ev3 = _wait_for(b, "quick_chat_received")
+    chat_ev3 = wait_for(b, "quick_chat_received")
     assert chat_ev3 is not None
     assert chat_ev3.payload["preset"] == 3
     assert chat_ev3.payload["sender"] == "white"
@@ -154,14 +141,14 @@ def test_post_result_chat_and_annotations_are_noops(server):
     _addr, a, b = _pair(server, DONE_WHITE, DONE_BLACK)
 
     a.send_resign()
-    a_result = _wait_for(a, "result")
-    b_result = _wait_for(b, "result")
+    a_result = wait_for(a, "result")
+    b_result = wait_for(b, "result")
     assert a_result is not None and a_result.payload["reason"] == "resignation"
     assert b_result is not None and b_result.payload["reason"] == "resignation"
 
     a.send_quick_chat(0)
     a.send_annotations_state(True, ["e4"], [("g1", "f3")])
-    leftover = _collect_for(b, 1.0)
+    leftover = collect_for(b, 1.0)
     stray = [ev.type for ev in leftover
              if ev.type in ("quick_chat_received", "annotations_state", "annotation_delta")]
     assert stray == []

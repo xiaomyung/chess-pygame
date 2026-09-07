@@ -1,5 +1,10 @@
 [
   {
+    "title": "v2.13.0 — Steady Hands",
+    "body": "Online play stops flinching:\n- The Resyncing… toast no longer fires when nothing is wrong — a move landing, a skill check resolving or a rematch starting is no longer mistaken for a board that has drifted; a board that genuinely is behind still gets repaired within a few seconds\n- A build the server is too new for now gets a clear Update required card naming both versions, instead of an endless search for a game it would never be given\n- The server keeps an eye on its own housekeeping and reports its health honestly, so the connection test can tell you when it is full or falling behind\n- A broad hardening pass underneath: cleaner refusals, tidier logs and steadier behaviour under load",
+    "date": "2026-09-07"
+  },
+  {
     "title": "v2.12.2 — Spring Cleaning",
     "body": "Under-the-hood maintenance release:\n- A full internal polish pass over the whole codebase, plus a sweep of small fixes it surfaced\n- Positions pasted as FEN now keep their move number, refuse a malformed side-to-move, and show the check highlight right away\n- Esc no longer acts on things hidden behind a blocking overlay, and sound switched on mid-game now works fully\n- Smoother long sessions: less busywork per frame during live games and when browsing past moves",
     "date": "2026-08-21"

@@ -6,10 +6,12 @@ Every test injects a fake `fetch_news` — zero real network."""
 import json
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
 
+import chessshootout
 from chessshootout.online import news
 from chessshootout.online.news import (
     NEWS_BODY_MAX_CHARS, NEWS_DATE_MAX_CHARS, NEWS_MAX_ITEMS, NEWS_TITLE_MAX_CHARS,
@@ -74,6 +76,15 @@ def test_parse_caps_at_news_max_items_keeping_the_newest():
     assert len(items) == NEWS_MAX_ITEMS
     expected = [f"item-{i}" for i in range(499, 499 - NEWS_MAX_ITEMS, -1)]
     assert [item["title"] for item in items] == expected
+
+
+def test_the_shipped_feed_fits_under_the_cap_and_parses_whole():
+    """The published feed only ever grows. A cap below its length would silently
+    drop the oldest items from the News card, and a malformed entry would vanish
+    the same way, so pin both against the real file."""
+    feed = Path(chessshootout.__file__).resolve().parent.parent / "news.json"
+    raw = json.loads(feed.read_text(encoding="utf-8"))
+    assert len(parse_news_items(raw)) == len(raw)
 
 
 def test_fetch_news_wraps_malformed_url_as_transport_error(monkeypatch):

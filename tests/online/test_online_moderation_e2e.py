@@ -20,8 +20,7 @@ import time
 
 from chessshootout.online.client import OnlineClient
 from tests.helpers import fake_uuid4
-from tests.online.test_online_flow import _wait_for
-from tests.online.test_online_share_chat_e2e import _collect_for
+from tests.online.online_helpers import collect_for, wait_for
 from tests.server import moderation_helpers as M
 
 
@@ -51,8 +50,8 @@ def _pair(server, white_uuid, black_uuid, *, black_hide=False):
     addr = f"localhost:{server}"
     a = _connect(addr, white_uuid, "Alice", "white")
     b = _connect(addr, black_uuid, "Bob", "black", hide=black_hide)
-    assert _wait_for(a, "game_start").payload["your_color"] == "white"
-    assert _wait_for(b, "game_start").payload["your_color"] == "black"
+    assert wait_for(a, "game_start").payload["your_color"] == "white"
+    assert wait_for(b, "game_start").payload["your_color"] == "black"
     return addr, a, b
 
 
@@ -61,13 +60,13 @@ def test_swastika_never_fully_reaches_receiver_and_drawer_is_blocked(server):
 
     a.send_annotations_state(True, [], SWASTIKA)
 
-    corrective = _wait_for(b, "annotations_state")
+    corrective = wait_for(b, "annotations_state")
     assert corrective is not None
     assert corrective.payload["sharing"] is True
     assert corrective.payload["arrows"] == []
     assert corrective.payload["highlights"] == []
 
-    blocked = _wait_for(a, "annotations_blocked")
+    blocked = wait_for(a, "annotations_blocked")
     assert blocked is not None
     assert blocked.payload["action"] == "blocked"
     got = {(arrow["from"], arrow["to"]) for arrow in blocked.payload["arrows"]}
@@ -99,7 +98,7 @@ def test_incremental_deltas_never_land_the_full_symbol_on_the_receiver(server):
         time.sleep(DELTA_PACING_S)
         apply_pending()
 
-    blocked = _wait_for(a, "annotations_blocked")
+    blocked = wait_for(a, "annotations_blocked")
     assert blocked is not None
     assert blocked.payload["action"] == "blocked"
 
@@ -120,21 +119,21 @@ def test_hide_toggle_opts_out_of_relay_via_matchmake_and_midgame(server):
     _addr, a, b = _pair(server, HIDE_WHITE, HIDE_BLACK, black_hide=True)
 
     a.send_annotations_state(True, ["e4"], [])
-    notice = _wait_for(a, "error")
+    notice = wait_for(a, "error")
     assert notice is not None
     assert notice.payload["reason"] == "opp_hides_marks"
-    stray = [ev.type for ev in _collect_for(b, 1.0) if ev.type == "annotations_state"]
+    stray = [ev.type for ev in collect_for(b, 1.0) if ev.type == "annotations_state"]
     assert stray == []
 
     a.send_annotation_delta("add", "highlight", square="d5")
-    repeat_notice = [ev for ev in _collect_for(a, 1.0) if ev.type == "error"]
+    repeat_notice = [ev for ev in collect_for(a, 1.0) if ev.type == "error"]
     assert repeat_notice == []
-    still = [ev.type for ev in _collect_for(b, 1.0)
+    still = [ev.type for ev in collect_for(b, 1.0)
              if ev.type in ("annotations_state", "annotation_delta")]
     assert still == []
 
     b.send_set_marks_visibility(False)
-    pushed = _wait_for(b, "annotations_state")
+    pushed = wait_for(b, "annotations_state")
     assert pushed is not None
     assert pushed.payload["sharing"] is True
     assert set(pushed.payload["highlights"]) == {"e4", "d5"}

@@ -1,4 +1,4 @@
-.PHONY: build up up-edge down logs loadtest update bump
+.PHONY: build up down logs loadtest update bump
 
 # Build the server image via compose.
 build:
@@ -8,15 +8,12 @@ build:
 bump:
 	uv version --bump patch
 
-# Local app-only container (no TLS/Caddy), published on 127.0.0.1:8000.
+# Start the one service this repo ships, published on 127.0.0.1:8000. TLS lives
+# in the standalone edge proxy stack, which is started from its own repo.
 up:
 	docker compose up -d gameserver
 
-# Full edge stack (needs ./secrets/*.pem + ./gameserver.env).
-up-edge:
-	docker compose up -d
-
-# Tear down the whole stack (keeps named volumes).
+# Stop and remove the gameserver container; the named data volume survives.
 down:
 	docker compose down
 

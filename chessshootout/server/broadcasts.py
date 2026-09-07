@@ -1,16 +1,18 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 from chessshootout.backend.backend import Backend
+from chessshootout.backend.clock import Clock
 from chessshootout.backend.fen import export_fen
+from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import coord_from_square
 from chessshootout.skillcheck.types import SkillCheckOutcome
 
 from chessshootout.server import logging_setup
 from chessshootout.server.connections import ConnectionRegistry, broadcast, send
 from chessshootout.server.protocol import (
-    GameStartMessage, IdleWindowMessage, IdleWindowWire, ResultMessage,
-    SkillCheckResultMessage)
+    ArrowWire, ClockSnapshot, GameStartMessage, IdleWindowMessage, IdleWindowWire,
+    ResultMessage, SkillCheckResultMessage)
 from chessshootout.server.rooms import PendingSkillCheck, Room, RoomManager
 
 
@@ -20,6 +22,39 @@ log = logging_setup.get_logger("chess.server.app")
 IDLE_WINDOW_PUSH_MIN_INTERVAL_SECONDS = 2.0
 
 
+def clock_snapshot(clock: Clock | None) -> ClockSnapshot:
+    """
+    Package both players' remaining time for the wire, in the shape every
+    frame that carries clocks expects. A game with no clock reports zeros
+    rather than nothing, so the client always has numbers to draw
+
+    :param clock: the room's engine clock, or None for an unclocked game.
+    :returns: the clock reading to put on the wire.
+    """
+    if clock is None:
+        return ClockSnapshot(white_remaining=0.0, black_remaining=0.0, running_for=None)
+    running = None
+    if clock.running_for is not None:
+        running = "white" if clock.running_for == PieceColor.WHITE else "black"
+    return ClockSnapshot(
+        white_remaining=clock.white_remaining,
+        black_remaining=clock.black_remaining,
+        running_for=running,
+    )
+
+
+def arrow_wires(pairs: Iterable[tuple[str, str]]) -> list[ArrowWire]:
+    """
+    Dress stored arrows up for the wire. Arrows live server-side as plain
+    square pairs, and this is the single place they become wire models --
+    the live relays and the resume snapshot both come through here
+
+    :param pairs: arrows as origin and destination squares in algebraic form.
+    :returns: the same arrows as wire models, in the order given.
+    """
+    return [ArrowWire(from_sq=a[0], to_sq=a[1]) for a in pairs]
+
+
 async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegistry,
                                  room: Room, reason: str,
                                  winner_color: str | None = None) -> None:
@@ -27,7 +62,9 @@ async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegi
     End a game once and tell both players how it ended. The room decides whether
     this attempt is the one that lands, and a concurrent caller that lost the
     race broadcasts nothing; the frame that does go out is built from the stored
-    result, so both players are always told the same outcome
+    result, so both players are always told the same outcome. Every game that
+    ends passes through here, so this is also where the one line describing the
+    ending is logged, whose duration is seconds since pairing
 
     :param rooms: room manager that records the result
     :param connections: registry used to reach both players
@@ -39,6 +76,9 @@ async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegi
     if not applied:
         return
     result_reason, result_winner = cast(tuple[str, str | None], room.result)
+    log.info("game finalized room=%s reason=%s winner=%s plies=%d duration_s=%.1f",
+             room.room_id, result_reason, result_winner or "none", room.plies_ever,
+             cast(float, room.ended_at) - cast(float, room.started_at))
     await broadcast(rooms, connections, room,
                     ResultMessage(reason=result_reason, winner_color=result_winner))
 
@@ -129,11 +169,14 @@ async def broadcast_game_start(connections: ConnectionRegistry, room: Room,
     both names with their countries and series scores, the time control and
     their own color. The frames are built per player because the color differs,
     and each carries how long ago the game actually started so a client that
-    joined late does not run its clock from the wrong instant
+    joined late does not run its clock from the wrong instant. The moment is
+    stamped as a history change with no previous length, since what a client
+    was showing before a game start cannot be known
 
     :param connections: registry used to reach both players
     :param room: paired room whose game is starting
     :param now: monotonic seconds source, read for the elapsed-since-start value
+        and for the history-change stamp
     :param rematch: True when this game follows an accepted rematch offer
     """
     fen = export_fen(cast(Backend, room.backend))
@@ -158,6 +201,7 @@ async def broadcast_game_start(connections: ConnectionRegistry, room: Room,
             rematch=rematch,
         ))
         sent.append(color)
+    room.note_history_change(now(), None)
     room.game_start_broadcast = True
     log.info("game_start broadcast room=%s sent_to=%s elapsed=%.2f",
              room.room_id, sent, started_seconds_ago)
