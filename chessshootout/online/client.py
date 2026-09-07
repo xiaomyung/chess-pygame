@@ -18,7 +18,7 @@ from chessshootout.online.transport import (
 from chessshootout.server.protocol import (
     CancelMatchmakeRequest, GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS,
     HEARTBEAT_MISS_LIMIT, MatchmakeRequest, Reason, ResumeRequest,
-    parse_client_version,
+    parse_client_version, version_text,
 )
 
 
@@ -680,8 +680,10 @@ class OnlineClient:
             self.state = "connecting"
             mm = await self._matchmake_with_retries(request)
         except ClientOutdated as exc:
+            parsed_minimum = parse_client_version(exc.min_version)
             log.warning("client outdated min_version=%s",
-                        parse_client_version(exc.min_version))
+                        "unparseable" if parsed_minimum is None
+                        else version_text(parsed_minimum))
             self._inbound.put(Event("error", {"reason": Reason.CLIENT_OUTDATED,
                                               "min_version": exc.min_version}))
             self.state = "disconnected"

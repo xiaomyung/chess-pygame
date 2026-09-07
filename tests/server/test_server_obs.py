@@ -14,11 +14,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from chessshootout.server.broadcasts import broadcast_game_start
-from chessshootout.server.handlers import (
-    HANDLERS, RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS, dispatch,
-)
+from chessshootout.server.handlers import HANDLERS, dispatch
 from chessshootout.server.protocol import (
-    GRACE_SECONDS, IDLE_RESIGN_SECONDS, PROTOCOL_VERSION, Reason,
+    GRACE_SECONDS, IDLE_RESIGN_SECONDS, PROTOCOL_VERSION,
+    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS, Reason,
 )
 from chessshootout.server.ws_session import WS_MESSAGES_PER_SECOND, _ws_session
 from chessshootout.server.sweep import PREGAME_CONNECT_GRACE_SECONDS

@@ -23,7 +23,7 @@ from chessshootout.online.client import (
 )
 from chessshootout.server.protocol import (
     FIRST_MOVE_ABORT_SECONDS, GRACE_SECONDS, PROTOCOL_VERSION, Reason,
-    parse_client_version,
+    parse_client_version, version_text,
 )
 from chessshootout.skillcheck.wheel import SKILLCHECK_DEADLINE_MS
 
@@ -76,9 +76,9 @@ ONLINE_TRANSIENT_REASON_LABELS = {
     Reason.OPP_HIDES_MARKS: "Opponent hides shared marks",
 }
 
-ONLINE_GAME_STATE_REASONS = {
+ONLINE_GAME_STATE_REASONS = frozenset({
     Reason.NOT_YOUR_TURN, Reason.INVALID_MOVE_FORMAT, Reason.INVALID_MESSAGE,
-}
+})
 
 UPDATE_REQUIRED_REASONS = frozenset({Reason.CLIENT_OUTDATED, Reason.VERSION_MISMATCH})
 
@@ -86,29 +86,20 @@ UPDATE_REQUIRED_TITLE = "Update required"
 UPDATE_REQUIRED_BUTTON = "OK"
 UPDATE_REQUIRED_UNKNOWN_SUB = "This server needs a newer build — update your install"
 UPDATE_REQUIRED_PROTOCOL_SUB = (
-    f"This server and this build speak different versions "
+    "This server and this build speak different versions "
     f"(server v?, client v{PROTOCOL_VERSION}) — update your install"
 )
 
-MOVE_REJECTION_REASONS = {
+MOVE_REJECTION_REASONS = frozenset({
     Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN, Reason.SKILLCHECK_PENDING,
     Reason.MOVE_LOCKED,
-}
+})
+
+MOVE_RESYNC_REASONS = frozenset({Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN})
 
 NOT_YOUR_TURN_TOASTS = {
     "takeback_request": "Take back is only available right after your move",
 }
-
-
-def _version_text(parsed: tuple[int, int, int]) -> str:
-    """
-    Write a version back out from the numbers it was read as, so only values
-    this build has parsed itself can ever reach the screen
-
-    :param parsed: the three version numbers
-    :returns: the version as major.minor.patch
-    """
-    return ".".join(str(part) for part in parsed)
 
 
 class ResyncCause:
@@ -488,23 +479,24 @@ class OnlineCoordinator:
         already under way or this client has already caught up to the very ply
         the order was written against -- an order the network delayed past its
         own answer. Anything unreadable in the payload is treated as an order
-        worth obeying, and printed as a repr so a server sending text where a
-        ply belongs cannot forge a second log line
+        worth obeying, and named only by its type, so a server sending text
+        where a ply belongs cannot put that text in the log
 
         :param payload: resync-directive message, carrying the ply the server
-            was on when it decided.
+            was on when it decided
         """
         if self._resyncing:
             return
         server_ply = payload.get("server_ply")
-        client_ply = self._heartbeat_ply()
         if isinstance(server_ply, int):
+            client_ply = self._heartbeat_ply()
             if client_ply is not None and server_ply == client_ply:
                 log.debug("resync directive server_ply=%d stale=True", server_ply)
                 return
             log.warning("resync directive server_ply=%d", server_ply)
         else:
-            log.warning("resync directive server_ply=%r", server_ply)
+            log.warning("resync directive server_ply_type=%s",
+                        type(server_ply).__name__)
         self._begin_resync(ResyncCause.SERVER_DIRECTIVE)
 
     def _handle_online_error(self, payload: dict[str, Any]) -> None:
@@ -512,7 +504,9 @@ class OnlineCoordinator:
         Decide what a rejection or failure from the server should look like to
         the player: silence for ordinary game-state answers, a toast for
         transient ones, a one-button update card for a build the server will
-        not take, and a confirm dialog with Retry for the hard failures. A
+        not take, and a confirm dialog with Retry for the hard failures. A move
+        the server refused as illegal or out of turn also rebuilds the game from
+        the server, since the two boards plainly disagree about the position. A
         reason string the server supplied is truncated before it reaches a toast
 
         :param payload: error message, keyed by reason plus the message type it
@@ -526,11 +520,10 @@ class OnlineCoordinator:
         if pending_move is not None and reason in MOVE_REJECTION_REASONS:
             game.skillcheck_session.pending_online_move = None
             game.board.selected_square = None
-            if reason in (Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN):
+            if reason in MOVE_RESYNC_REASONS:
                 self._begin_resync(ResyncCause.MOVE_REJECTED)
             return
-        if (reason in (Reason.INVALID_MOVE_FORMAT, Reason.NOT_YOUR_TURN)
-                and payload.get("msg_type") == "move"):
+        if reason in MOVE_RESYNC_REASONS and payload.get("msg_type") == "move":
             self._begin_resync(ResyncCause.MOVE_REJECTED)
             return
         if reason == Reason.NOT_YOUR_TURN:
@@ -564,10 +557,7 @@ class OnlineCoordinator:
             return
         if reason in UPDATE_REQUIRED_REASONS:
             log.warning("online update required reason=%s", reason)
-            self._end_resync(replay=False)
-            self.wait_modal.hide()
-            self.match_found_modal.hide()
-            self.offer_banners.clear()
+            self._dismiss_pairing_ui()
             self.app.confirm_modal.show(
                 UPDATE_REQUIRED_TITLE,
                 on_yes=self._on_online_cancel,
@@ -577,10 +567,7 @@ class OnlineCoordinator:
             return
         if reason in ONLINE_HARD_FAILURE_REASONS or reason.startswith("http_"):
             log.warning("online hard failure reason=%s", reason)
-            self._end_resync(replay=False)
-            self.wait_modal.hide()
-            self.match_found_modal.hide()
-            self.offer_banners.clear()
+            self._dismiss_pairing_ui()
             label = ONLINE_HARD_FAILURE_LABELS.get(
                 reason, ONLINE_HARD_FAILURE_LABELS[ClientReason.SERVER_UNREACHABLE])
             self.app.confirm_modal.show(
@@ -596,6 +583,17 @@ class OnlineCoordinator:
             self.app.toast.show(label)
         else:
             self.app.toast.show("Server error")
+
+    def _dismiss_pairing_ui(self) -> None:
+        """
+        Clear everything a search or a game had on screen before a dialog takes
+        over: any rebuild in progress, both pairing cards and the offer banners.
+        Shared by the refusals that end with a confirm dialog of their own
+        """
+        self._end_resync(replay=False)
+        self.wait_modal.hide()
+        self.match_found_modal.hide()
+        self.offer_banners.clear()
 
     def _update_required_sub(self, reason: str, payload: dict[str, Any]) -> str:
         """
@@ -616,8 +614,8 @@ class OnlineCoordinator:
         minimum = parse_client_version(payload.get("min_version"))
         if mine is None or minimum is None:
             return UPDATE_REQUIRED_UNKNOWN_SUB
-        return (f"You run v{_version_text(mine)} · this server needs "
-                f"v{_version_text(minimum)} or newer — update your install")
+        return (f"You run v{version_text(mine)} · this server needs "
+                f"v{version_text(minimum)} or newer — update your install")
 
     def _opp_name(self) -> str:
         """
@@ -787,7 +785,7 @@ class OnlineCoordinator:
         it lands. Asking again while one is already running does nothing, so the
         one line it writes marks the start of a repair, not every attempt
 
-        :param cause: which ResyncCause member sent us here.
+        :param cause: which ResyncCause member sent us here
         """
         if self._resyncing:
             return
@@ -1355,7 +1353,7 @@ class OnlineCoordinator:
         the server judges nothing
 
         :returns: half-moves applied on the online board, or None when this
-            client is not sitting on one.
+            client is not sitting on one
         """
         game = self.app.game
         if (self.app.screen is not game or game.variant != Variant.ONLINE
@@ -1644,13 +1642,13 @@ class OnlineCoordinator:
         """
         Rebuild a whole game out of a server snapshot -- menu settings, board,
         clocks, marks and any pending skill check -- as one step, so a half
-        restored game can never be left on screen. Any pairing still waiting
-        behind the match-found card is dropped with it, since the snapshot is
-        now the board this client is on
+        restored game can never be left on screen. Whatever the search still had
+        on screen or was holding back goes with it, since the snapshot is now
+        the board this client is on
 
         :param resume: resume snapshot fetched from the server
         """
-        self._pending_game_start_payload = None
+        self._clear_search_state()
         self.app.menu.apply_resume_config(resume)
         self._start_online_game(resume)
         self._handle_game_resumed(resume)

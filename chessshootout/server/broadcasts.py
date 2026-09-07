@@ -1,16 +1,18 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 from chessshootout.backend.backend import Backend
+from chessshootout.backend.clock import Clock
 from chessshootout.backend.fen import export_fen
+from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import coord_from_square
 from chessshootout.skillcheck.types import SkillCheckOutcome
 
 from chessshootout.server import logging_setup
 from chessshootout.server.connections import ConnectionRegistry, broadcast, send
 from chessshootout.server.protocol import (
-    GameStartMessage, IdleWindowMessage, IdleWindowWire, ResultMessage,
-    SkillCheckResultMessage)
+    ArrowWire, ClockSnapshot, GameStartMessage, IdleWindowMessage, IdleWindowWire,
+    ResultMessage, SkillCheckResultMessage)
 from chessshootout.server.rooms import PendingSkillCheck, Room, RoomManager
 
 
@@ -18,6 +20,39 @@ log = logging_setup.get_logger("chess.server.app")
 
 
 IDLE_WINDOW_PUSH_MIN_INTERVAL_SECONDS = 2.0
+
+
+def clock_snapshot(clock: Clock | None) -> ClockSnapshot:
+    """
+    Package both players' remaining time for the wire, in the shape every
+    frame that carries clocks expects. A game with no clock reports zeros
+    rather than nothing, so the client always has numbers to draw
+
+    :param clock: the room's engine clock, or None for an unclocked game.
+    :returns: the clock reading to put on the wire.
+    """
+    if clock is None:
+        return ClockSnapshot(white_remaining=0.0, black_remaining=0.0, running_for=None)
+    running = None
+    if clock.running_for is not None:
+        running = "white" if clock.running_for == PieceColor.WHITE else "black"
+    return ClockSnapshot(
+        white_remaining=clock.white_remaining,
+        black_remaining=clock.black_remaining,
+        running_for=running,
+    )
+
+
+def arrow_wires(pairs: Iterable[tuple[str, str]]) -> list[ArrowWire]:
+    """
+    Dress stored arrows up for the wire. Arrows live server-side as plain
+    square pairs, and this is the single place they become wire models --
+    the live relays and the resume snapshot both come through here
+
+    :param pairs: arrows as origin and destination squares in algebraic form.
+    :returns: the same arrows as wire models, in the order given.
+    """
+    return [ArrowWire(from_sq=a[0], to_sq=a[1]) for a in pairs]
 
 
 async def finalize_and_broadcast(rooms: RoomManager, connections: ConnectionRegistry,

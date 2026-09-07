@@ -16,7 +16,7 @@ for no extra claim.
 import time
 
 from chessshootout.online.client import OnlineClient
-from chessshootout.server.handlers import (
+from chessshootout.server.protocol import (
     RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
 )
 from tests.helpers import fake_uuid4

@@ -452,11 +452,15 @@ async def test_takeback_is_blocked_while_a_check_is_pending(app, clock):
 
 @pytest.mark.asyncio
 async def test_ping_emits_no_resync_while_pending(app, clock):
+    """A held move legitimately sits at the same ply, so the mover's heartbeat
+    matches and is answered as a plain caught-up ping. A mismatching one is not
+    judged at all while a check is running -- the position is mid-flight."""
     room, ws_w, ws_b, frm, to = await _capture_room(app, clock, WHEEL)
     await handle_move(app, ws_w, room, "white", _move_raw(frm, to))
-    out = await handle_ping(app, ws_w, room, "white", '{"type":"ping","ply":0}')
+    assert await handle_ping(app, ws_w, room, "white", '{"type":"ping","ply":0}') == "ping"
+    out = await handle_ping(app, ws_w, room, "white", '{"type":"ping","ply":7}')
     assert out == "ping_pending"
-    assert not ws_w.of_type("resync_directive"), "a held move legitimately sits at the same ply"
+    assert not ws_w.of_type("resync_directive")
     assert room.white.desync_active is False
 
 

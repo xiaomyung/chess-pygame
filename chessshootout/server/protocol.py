@@ -15,7 +15,9 @@ log = logging_setup.get_logger("chess.server.app")
 
 MIN_GRACE_SECONDS = 1.0
 MIN_HEARTBEAT_INTERVAL_SECONDS = 0.5
-MIN_HEARTBEAT_MISS_LIMIT = 1
+MIN_HEARTBEAT_MISS_LIMIT = 2
+TRANSIT_GRACE_CEILING_SECONDS = 1.5
+TRANSIT_GRACE_HEARTBEAT_FRACTION = 0.75
 
 
 def _env_float(name: str, default: float, *, minimum: float) -> float:
@@ -90,6 +92,20 @@ def _read_tuning() -> tuple[float, float, int]:
     )
 
 
+def _transit_grace(interval: float) -> float:
+    """
+    Work out how long a heartbeat may still describe the position as it was
+    just before the latest change. It has to cover a round trip plus a client
+    frame, and stay strictly under one heartbeat so at most one heartbeat per
+    change is ever forgiven
+
+    :param interval: seconds between heartbeats, as the server asks for them.
+    :returns: seconds a history change keeps excusing a stale heartbeat.
+    """
+    return min(TRANSIT_GRACE_CEILING_SECONDS,
+               interval * TRANSIT_GRACE_HEARTBEAT_FRACTION)
+
+
 PROTOCOL_VERSION = 6
 MIN_CLIENT_VERSION = "2.13.0"
 CLIENT_VERSION_MAX_LEN = 32
@@ -106,6 +122,11 @@ MIN_INCREMENT_SECONDS = 0
 MAX_INCREMENT_SECONDS = 180
 GRACE_SECONDS, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT = _read_tuning()
 HEARTBEAT_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL_SECONDS * HEARTBEAT_MISS_LIMIT
+RESYNC_TRANSIT_GRACE_SECONDS = _transit_grace(HEARTBEAT_INTERVAL_SECONDS)
+RESYNC_STABLE_MISMATCH_HEARTBEATS = 2
+RESYNC_STRIKE_TTL_SECONDS = (
+    HEARTBEAT_INTERVAL_SECONDS * RESYNC_STABLE_MISMATCH_HEARTBEATS
+    + RESYNC_TRANSIT_GRACE_SECONDS)
 MAX_SHARED_HIGHLIGHTS = 64
 MAX_SHARED_ARROWS = 128
 CHAT_COOLDOWN_SECONDS = 3.0
@@ -192,6 +213,17 @@ def parse_client_version(raw: object) -> tuple[int, int, int] | None:
     return (major, minor, patch)
 
 
+def version_text(parsed: tuple[int, int, int]) -> str:
+    """
+    Write a build version back out from the numbers it was read as, so only a
+    value that has already been parsed can ever reach a log line or a screen
+
+    :param parsed: the three version numbers.
+    :returns: the version as major.minor.patch.
+    """
+    return ".".join(str(part) for part in parsed)
+
+
 def client_version_outdated(client_version: str, minimum: str) -> bool:
     """
     Decide whether a build is too old to be let into a game. A build that states
@@ -268,6 +300,18 @@ class Reason:
     ABORTED = "aborted"
     ABANDONMENT = "abandonment"
     SERVER_SHUTDOWN = "server_shutdown"
+
+
+RESULT_REASON_BY_GAME_RESULT = {
+    "white_wins": (Reason.CHECKMATE, "white"),
+    "black_wins": (Reason.CHECKMATE, "black"),
+    "white_wins_on_time": (Reason.TIMEOUT, "white"),
+    "black_wins_on_time": (Reason.TIMEOUT, "black"),
+    "draw_stalemate": (Reason.DRAW_STALEMATE, None),
+    "draw_repetition": (Reason.DRAW_REPETITION, None),
+    "draw_fifty_move": (Reason.DRAW_FIFTY_MOVE, None),
+    "draw_insufficient_material": (Reason.DRAW_INSUFFICIENT_MATERIAL, None),
+}
 
 
 class HealthStatus:
@@ -716,9 +760,9 @@ class HealthResponse(BaseModel):
     the last complete housekeeping pass
     """
 
-    status: str = HealthStatus.OK
+    status: str = Field(default=HealthStatus.OK, max_length=32)
     version: int = PROTOCOL_VERSION
-    app_version: str = ""
+    app_version: str = Field(default="", max_length=64)
     rooms_active: int
     queue_depth: int = 0
     uptime_s: float = 0.0

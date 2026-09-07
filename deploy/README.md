@@ -84,7 +84,7 @@ EOF
 set `LOG_FILE` (logs go to stdout). `TRUSTED_PROXIES` is set in `docker-compose.yml`
 (the edge proxy's IP on the `edge` network), not here. Optional tunables you can add to
 `gameserver.env`, with the floor each one is held to: `GRACE_SECONDS=60` (min `1.0`),
-`HEARTBEAT_INTERVAL_SECONDS=2` (min `0.5`), `HEARTBEAT_MISS_LIMIT=3` (min `1`).
+`HEARTBEAT_INTERVAL_SECONDS=2` (min `0.5`), `HEARTBEAT_MISS_LIMIT=3` (min `2`).
 
 A tunable that does not parse as a number falls back to its default; one that parses
 but is below its floor — or is an infinity or a nan — is replaced by the floor. Either

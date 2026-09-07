@@ -8,7 +8,8 @@ from chessshootout.server.broadcasts import finalize_and_broadcast, resolve_skil
 from chessshootout.server.connections import ConnectionRegistry, send
 from chessshootout.server.protocol import (
     ConnectionStatusMessage, ErrorMessage, GRACE_SECONDS,
-    QUEUE_MAX_WAIT_SECONDS, Reason, RematchUpdateEvent, RematchUpdateMessage,
+    QUEUE_MAX_WAIT_SECONDS, RESULT_REASON_BY_GAME_RESULT, Reason, RematchUpdateEvent,
+    RematchUpdateMessage,
 )
 from chessshootout.server.rooms import (
     REMATCH_ABSOLUTE_CAP_SECONDS, REMATCH_IDLE_SECONDS, POST_GAME_DISCONNECT_GRACE,
@@ -23,18 +24,6 @@ PREGAME_CONNECT_GRACE_SECONDS = 5.0
 WS_CLOSE_QUEUE_TIMEOUT = 4004
 SWEEP_STALE_SECONDS = 30.0
 SWEEP_ERROR_LOG_INTERVAL_SECONDS = 60.0
-
-
-RESULT_REASON_BY_GAME_RESULT = {
-    "white_wins": (Reason.CHECKMATE, "white"),
-    "black_wins": (Reason.CHECKMATE, "black"),
-    "white_wins_on_time": (Reason.TIMEOUT, "white"),
-    "black_wins_on_time": (Reason.TIMEOUT, "black"),
-    "draw_stalemate": (Reason.DRAW_STALEMATE, None),
-    "draw_repetition": (Reason.DRAW_REPETITION, None),
-    "draw_fifty_move": (Reason.DRAW_FIFTY_MOVE, None),
-    "draw_insufficient_material": (Reason.DRAW_INSUFFICIENT_MATERIAL, None),
-}
 
 
 class Sweep:

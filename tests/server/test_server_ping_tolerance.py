@@ -31,12 +31,12 @@ import chessshootout
 from chessshootout.backend.utils import square_from_coord
 from chessshootout.server.broadcasts import broadcast_game_start
 from chessshootout.server.handlers import (
-    RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS, RESYNC_STABLE_MISMATCH_HEARTBEATS,
-    RESYNC_TRANSIT_GRACE_SECONDS, _newest_change_age, _transit_grace, handle_move,
+    RESYNC_DIRECTIVE_MIN_INTERVAL_SECONDS, _newest_change_age, handle_move,
     handle_ping, handle_takeback_request, handle_takeback_response,
 )
 from chessshootout.server.protocol import (
-    HEARTBEAT_INTERVAL_SECONDS, PROTOCOL_VERSION, Reason,
+    HEARTBEAT_INTERVAL_SECONDS, PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
+    RESYNC_STRIKE_TTL_SECONDS, RESYNC_TRANSIT_GRACE_SECONDS, Reason, _transit_grace,
 )
 from chessshootout.server.rooms import HISTORY_CHANGE_WINDOW, PendingSkillCheck
 from chessshootout.skillcheck.types import SkillCheckKind
@@ -428,6 +428,132 @@ async def test_a_resume_tells_the_opponent_the_board_is_being_rebuilt(app, clien
     assert resp.status_code == 200
     assert room.white.desync_active is True
     assert [m["opp_state"] for m in ws_b.of_type("connection_status")] == ["resyncing"]
+
+
+async def test_strikes_further_apart_than_the_ttl_never_add_up(app, clock):
+    """Strikes are consecutive in TIME as well as in count. Without the TTL a
+    client that mismatches once an hour -- a genuine one-off race each time --
+    eventually accumulated its way into a repair order it never earned, because
+    nothing but a matching heartbeat ever reset the counter."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    clock.advance(RESYNC_STRIKE_TTL_SECONDS + 0.1)
+
+    out = await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+
+    assert out == "ping_strike", "the stale strike expired; this one starts afresh"
+    assert room.white.ply_mismatch_streak == 1
+    assert _directives(ws_w) == []
+
+
+async def test_the_ttl_is_long_enough_for_the_strikes_it_counts(app, clock):
+    """The TTL has to outlast the heartbeats the streak is measured in, or the
+    rule it guards could never be met: two judged heartbeats one interval apart,
+    plus the transit grace one of them may have spent being excused."""
+    assert RESYNC_STRIKE_TTL_SECONDS > (
+        HEARTBEAT_INTERVAL_SECONDS * RESYNC_STABLE_MISMATCH_HEARTBEATS)
+    room, ws_w, ws_b = await _live_room(app, clock)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    clock.advance(HEARTBEAT_INTERVAL_SECONDS)
+
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_directed"
+
+
+async def test_an_inflight_heartbeat_between_two_strikes_resets_the_streak(app, clock):
+    """A client that reports exactly the length the history had a moment ago is
+    demonstrably following the history, whatever it mismatched about before. It
+    is proof of tracking, so it spends the strikes the same way a matching
+    heartbeat does."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    assert await handle_ping(app, ws_b, room, "black", _ping_raw(7)) == "ping_strike"
+    await handle_move(app, ws_w, room, "white", _move_raw("e2", "e4"))
+
+    assert await handle_ping(app, ws_b, room, "black", _ping_raw(0)) == "ping_inflight"
+    assert room.black.ply_mismatch_streak == 0
+
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+    assert await handle_ping(app, ws_b, room, "black", _ping_raw(7)) == "ping_strike"
+    assert _directives(ws_b) == []
+
+
+async def test_a_caught_up_heartbeat_clears_the_resync_even_during_a_check(app, clock):
+    """An exact match is never a resync, so it is settled before the skill-check
+    gate rather than behind it. A check can run for five seconds; a player who
+    was being repaired and has since caught up must not stay reported as broken
+    for the whole of it."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    now_ms = app.state.now_ms()
+    room.pending_skillcheck = PendingSkillCheck(
+        color="white", from_sq=square_from_coord("e4"), to_sq=square_from_coord("d5"),
+        promotion=None, kind=SkillCheckKind.WHEEL, seed="0" * 32, value_diff=0,
+        start_ms=now_ms, expires_at_ms=now_ms + SKILLCHECK_HOLD_MS,
+    )
+    room.white.mark_desynced()
+
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(0)) == "ping"
+
+    assert room.white.desync_active is False
+    assert [m["opp_state"] for m in ws_b.of_type("connection_status")] == ["connected"]
+
+
+async def test_a_gated_heartbeat_writes_no_line_of_its_own(app, clock, caplog):
+    """The line rides the order, not the mismatch: a heartbeat held back by the
+    directive interval sent nothing, so there is nothing for an operator to
+    read about it."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_directed"
+    await _strike_up_to_directive(app, clock, room, ws_w, "white", 7)
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        caplog.clear()
+        out = await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+
+    assert out == "ping_gated"
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+async def test_a_resume_does_not_restart_the_lagging_spells_line(
+        app, client, clock, caplog):
+    """/resume raises the desync flag itself, so the spell is already running by
+    the time the first directive is written. It is still one spell and still one
+    line, however long the client keeps lagging afterwards."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    resp = client.post("/resume", json={
+        "version": PROTOCOL_VERSION, "room_id": room.room_id,
+        "session_token": room.white.session_token,
+    })
+    assert resp.status_code == 200
+    assert room.white.desync_active is True
+
+    with caplog.at_level(logging.INFO, logger="chess.server.app"):
+        for _ in range(10):
+            await handle_ping(app, ws_w, room, "white", _ping_raw(7))
+            clock.advance(HEARTBEAT_INTERVAL_SECONDS)
+
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("resync directive")]
+    assert len(lines) == 1
+    assert len(_directives(ws_w)) > 1
+
+
+async def test_a_resume_on_a_finished_room_tells_the_opponent_nothing(
+        app, client, clock):
+    """The result screen is not a repair in progress. A /resume there -- which
+    is exactly what a client does when it reconnects to a game that ended while
+    it was away -- used to light the opponent's strip up with 'resyncing' for a
+    game neither of them is playing any more."""
+    room, ws_w, ws_b = await _live_room(app, clock)
+    room.result = (Reason.RESIGNATION, "black")
+
+    resp = client.post("/resume", json={
+        "version": PROTOCOL_VERSION, "room_id": room.room_id,
+        "session_token": room.white.session_token,
+    })
+
+    assert resp.status_code == 200
+    assert room.white.desync_active is False
+    assert ws_b.of_type("connection_status") == []
 
 
 async def test_a_landed_move_clears_the_movers_strike(app, clock):

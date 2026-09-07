@@ -13,9 +13,10 @@ from chessshootout.backend.utils import (
 )
 from chessshootout.server import logging_setup
 from chessshootout.server.broadcasts import (
-    finalize_and_broadcast, idle_window_wire, resolve_skillcheck_fail)
+    arrow_wires, clock_snapshot, finalize_and_broadcast, idle_window_wire,
+    resolve_skillcheck_fail,
+)
 from chessshootout.server.connections import ConnectionRegistry, send
-from chessshootout.server.handlers import arrow_wires, clock_snapshot
 from chessshootout.server.limits import (
     MATCHMAKE_PER_IP_LIMIT, RECLAIM_PER_IP_LIMIT, RESUME_PER_IP_LIMIT, UuidRateLimiter,
 )
@@ -26,7 +27,7 @@ from chessshootout.server.protocol import (
     PROTOCOL_VERSION, PendingSkillCheckWire, Reason, ReasonEnvelope, ReclaimRequest,
     ReclaimResponse, RematchUpdateMessage, ResumeRequest, ResumeResponse,
     SkillCheckOutcomeWire, WS_CLOSE_SUPERSEDED,
-    client_version_outdated, parse_client_version,
+    client_version_outdated, parse_client_version, version_text,
 )
 from chessshootout.server.rooms import (
     AlreadyInGameError, GameAlreadyStartedError, InvalidTokenError, NotInRoomError,
@@ -99,9 +100,10 @@ def _pending_skillcheck_wire(
         none or it is already dead
     """
     pending = room.pending_skillcheck
-    if pending is None or pending.is_dead(now_ms()):
+    at_ms = now_ms()
+    if pending is None or pending.is_dead(at_ms):
         return None
-    elapsed = max(0.0, now_ms() - pending.start_ms)
+    elapsed = max(0.0, at_ms - pending.start_ms)
     return PendingSkillCheckWire(
         kind=pending.kind.value, seed=pending.seed, value_diff=pending.value_diff,
         deadline_ms=pending.deadline_ms, captured_value=pending.captured_value,
@@ -145,6 +147,30 @@ def build_http_router(
     :returns: the router to mount on the application
     """
     router = APIRouter()
+    build_version = app_version()
+
+    def _enforce_client_build(body: MatchmakeRequest) -> None:
+        """
+        Turn a build this server will not play with away before matchmaking
+        touches a single room: one that speaks another protocol version, and one
+        older than the oldest release still accepted. Both refusals name the
+        reason, and the outdated one names the version to update to
+
+        :param body: the matchmaking request, read for its two version fields
+        """
+        if body.version != PROTOCOL_VERSION:
+            log.info("matchmake rejected uuid=%s reason=%s version=%d",
+                     body.client_uuid[:8], Reason.VERSION_MISMATCH, body.version)
+            raise HTTPException(status_code=426,
+                                detail={"reason": Reason.VERSION_MISMATCH})
+        if client_version_outdated(body.client_version, MIN_CLIENT_VERSION):
+            parsed = parse_client_version(body.client_version)
+            log.info("matchmake rejected uuid=%s reason=%s version=%s",
+                     body.client_uuid[:8], Reason.CLIENT_OUTDATED,
+                     "unparseable" if parsed is None else version_text(parsed))
+            raise HTTPException(status_code=426,
+                                detail={"reason": Reason.CLIENT_OUTDATED,
+                                        "min_version": MIN_CLIENT_VERSION})
 
     @router.get("/")
     async def root() -> dict[str, Any]:
@@ -195,7 +221,7 @@ def build_http_router(
             status = HealthStatus.DEGRADED
         return HealthResponse(
             status=status,
-            app_version=app_version(),
+            app_version=build_version,
             rooms_active=rooms.rooms_active,
             queue_depth=rooms.queue_depth,
             uptime_s=now_provider() - started_at,
@@ -221,20 +247,7 @@ def build_http_router(
         :returns: the room to open the game connection on, with the session
             token for it
         """
-        if body.version != PROTOCOL_VERSION:
-            log.info("matchmake rejected uuid=%s reason=%s version=%d",
-                     body.client_uuid[:8], Reason.VERSION_MISMATCH, body.version)
-            raise HTTPException(status_code=426,
-                                detail={"reason": Reason.VERSION_MISMATCH})
-        if client_version_outdated(body.client_version, MIN_CLIENT_VERSION):
-            parsed = parse_client_version(body.client_version)
-            log.info("matchmake rejected uuid=%s reason=%s version=%s",
-                     body.client_uuid[:8], Reason.CLIENT_OUTDATED,
-                     "unparseable" if parsed is None
-                     else ".".join(str(part) for part in parsed))
-            raise HTTPException(status_code=426,
-                                detail={"reason": Reason.CLIENT_OUTDATED,
-                                        "min_version": MIN_CLIENT_VERSION})
+        _enforce_client_build(body)
         log.info("matchmake nickname=%s uuid=%s tc=%s+%s side=%s",
                  body.nickname, body.client_uuid[:8],
                  body.time_minutes, body.increment_seconds, body.side_preference)
@@ -334,6 +347,7 @@ def build_http_router(
         if slot is None:
             log.info("resume rejected room=%s reason=session_expired", body.room_id)
             raise HTTPException(status_code=401, detail={"reason": Reason.SESSION_EXPIRED})
+        seat_color = cast(str, color)
         dead = room.pending_skillcheck
         if dead is not None and dead.is_dead(now_ms()):
             await resolve_skillcheck_fail(rooms, connections, room)
@@ -356,16 +370,17 @@ def build_http_router(
             for e in room.skillcheck_log]
         white_annotations = _annotation_set_wire(room.annotations_white)
         black_annotations = _annotation_set_wire(room.annotations_black)
-        if room.hides_opponent_marks(cast(str, color)):
-            if color == "white":
+        if room.hides_opponent_marks(seat_color):
+            if seat_color == "white":
                 black_annotations = AnnotationSetWire()
             else:
                 white_annotations = AnnotationSetWire()
+        backend = cast(Backend, room.backend)
         response = ResumeResponse(
-            fen=export_fen(cast(Backend, room.backend)),
+            fen=export_fen(backend),
             move_history=history,
-            clock=clock_snapshot(cast(Backend, room.backend).clock),
-            your_color=color,
+            clock=clock_snapshot(backend.clock),
+            your_color=seat_color,
             white_name=room.white.nickname if room.white else "",
             black_name=room.black.nickname if room.black else "",
             time_minutes=room.time_minutes,
@@ -379,21 +394,22 @@ def build_http_router(
             skillcheck_log=skillcheck_log,
             white_annotations=white_annotations,
             black_annotations=black_annotations,
-            share_muted=room.annotations_for(cast(str, color)).share_muted,
+            share_muted=room.annotations_for(seat_color).share_muted,
             hide_opp_marks=slot.hide_opp_marks,
             result_reason=room.result[0] if room.result else None,
             result_winner=room.result[1] if room.result else None,
             idle_window=idle_window_wire(room, now_provider()),
         )
-        log.info("resume served room=%s color=%s ply=%d", body.room_id, color, len(history))
-        slot.ply_mismatch_streak = 0
-        if (connections.get_for_color(room, cast(str, color)) is not None
-                and not slot.desync_active):
-            slot.desync_active = True
-            opp_ws = connections.get_for_color(
-                room, room.opp_color(cast(str, color)))
-            if opp_ws is not None:
-                await send(opp_ws, ConnectionStatusMessage(opp_state="resyncing"))
+        log.info("resume served room=%s color=%s ply=%d",
+                 body.room_id, seat_color, len(history))
+        slot.clear_strikes()
+        if room.result is None:
+            if (connections.get_for_color(room, seat_color) is not None
+                    and not slot.desync_active):
+                slot.mark_desynced()
+                opp_ws = connections.get_for_color(room, room.opp_color(seat_color))
+                if opp_ws is not None:
+                    await send(opp_ws, ConnectionStatusMessage(opp_state="resyncing"))
         return response
 
     @router.post("/reclaim", response_model=ReclaimResponse,

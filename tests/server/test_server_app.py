@@ -20,7 +20,6 @@ from chessshootout.server.connections import ConnectionRegistry
 from chessshootout.server.handlers import (
     RESYNC_DIRECTIVE, RESYNC_GATE_PRUNE_THRESHOLD, RESYNC_NOTIFY,
     RESYNC_NOTIFY_FLAP_FLOOR_SECONDS, RESYNC_NOTIFY_MIN_INTERVAL_SECONDS,
-    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
     _ResyncGate, handle_ping,
 )
 from chessshootout.server.protocol import (
@@ -28,8 +27,9 @@ from chessshootout.server.protocol import (
     HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS, HealthStatus,
     CLIENT_VERSION_MAX_LEN, IDLE_RESIGN_SECONDS, MAX_INCREMENT_SECONDS,
     MAX_TIME_MINUTES, MIN_CLIENT_VERSION, MIN_INCREMENT_SECONDS, MIN_TIME_MINUTES,
-    PROTOCOL_VERSION, Reason, WS_CLOSE_INVALID_TOKEN, WS_CLOSE_PAYLOAD_TOO_LARGE,
-    WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED,
+    PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
+    RESYNC_TRANSIT_GRACE_SECONDS, Reason, WS_CLOSE_INVALID_TOKEN,
+    WS_CLOSE_PAYLOAD_TOO_LARGE, WS_CLOSE_SERVER_SHUTDOWN, WS_CLOSE_SUPERSEDED,
 )
 from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
 from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
@@ -746,6 +746,39 @@ def test_in_session_frame_over_the_byte_cap_closes_as_too_large(client):
             with pytest.raises(WebSocketDisconnect) as exc:
                 ws_w.receive_text()
     assert exc.value.code == WS_CLOSE_PAYLOAD_TOO_LARGE
+
+
+@pytest.mark.parametrize("frame", [
+    pytest.param("[1]", id="json_array"),
+    pytest.param("5", id="json_number"),
+    pytest.param("null", id="json_null"),
+    pytest.param('"x"', id="json_string"),
+    pytest.param('{"type": ["ping"]}', id="type_is_not_a_string"),
+])
+def test_a_frame_that_is_not_an_object_is_refused_without_closing(client, frame):
+    """SECURITY: peek_type used to call .get() on whatever json.loads returned,
+    so any valid JSON that is not an object raised AttributeError inside the
+    dispatch loop. That escaped past the receive_text guards and killed the
+    session — a one-byte frame ended a live game. Every one of these is answered
+    with an ordinary invalid_message and the socket plays on."""
+    random.seed(0)
+    a = _matchmake(client, uuid=ALICE, side="white").json()
+    b = _matchmake(client, uuid=BOB, side="black").json()
+    with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
+        with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
+            ws_w.receive_text()
+            ws_b.receive_text()
+
+            ws_w.send_text(frame)
+            err = json.loads(ws_w.receive_text())
+            ws_w.send_text(json.dumps({"version": PROTOCOL_VERSION, "type": "ping"}))
+            pong = json.loads(ws_w.receive_text())
+
+    assert err["type"] == "error"
+    assert err["reason"] == Reason.INVALID_MESSAGE
+    assert pong["type"] == "pong", "the socket is still open and still serving"
 
 
 def test_ws_rejects_version_mismatch_auth(client):

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import time
 from collections.abc import AsyncIterator, Callable
@@ -13,9 +14,6 @@ from slowapi.errors import RateLimitExceeded
 
 from chessshootout.server import logging_setup
 from chessshootout.server.connections import ConnectionRegistry, send
-from chessshootout.server.handlers import (
-    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
-)
 from chessshootout.server.limits import (
     RECLAIM_PER_UUID_LIMIT_PER_MINUTE, RECLAIM_WINDOW_SECONDS, UuidRateLimiter,
     client_ip_key, log_trusted_proxies,
@@ -24,7 +22,8 @@ from chessshootout.server.moderation import library
 from chessshootout.server.protocol import (
     ANNOTATIONS_PER_SECOND, CHAT_COOLDOWN_SECONDS, GRACE_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_MISS_LIMIT, HEARTBEAT_TIMEOUT_SECONDS,
-    PROTOCOL_VERSION, Reason, ResultMessage, WS_CLOSE_SERVER_SHUTDOWN,
+    PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
+    RESYNC_TRANSIT_GRACE_SECONDS, Reason, ResultMessage, WS_CLOSE_SERVER_SHUTDOWN,
 )
 from chessshootout.server.rooms import RoomManager
 from chessshootout.server.routes_http import app_version, build_http_router
@@ -121,6 +120,8 @@ def create_app(*, now_provider: Callable[[], float] = time.monotonic,
                      now_provider() - started_at, rooms.rooms_active,
                      rooms.queue_depth, sum(1 for _ in connections.all_active()))
             sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweep_task
             shutdown_msg = ResultMessage(reason=Reason.SERVER_SHUTDOWN)
             for _, ws in list(connections.all_active()):
                 await send(ws, shutdown_msg)

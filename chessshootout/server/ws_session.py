@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from chessshootout.server import logging_setup
 from chessshootout.server.broadcasts import broadcast_game_start
 from chessshootout.server.connections import ConnectionRegistry, send
-from chessshootout.server.handlers import dispatch
+from chessshootout.server.handlers import HANDLERS, dispatch, peek_type
 from chessshootout.server.limits import UuidRateLimiter
 from chessshootout.server.protocol import (
     AuthMessage, ConnectionStatusMessage, ErrorMessage, PROTOCOL_VERSION, Reason,
@@ -95,7 +95,9 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
     the dispatch table until the socket goes away. The player's color is re-read
     from the room on every frame, because a rematch swaps colors underneath a
     connection that never dropped. Oversized frames close the socket outright,
-    and a flood is answered with an error frame instead of being processed
+    a flood is answered with an error frame instead of being processed, and a
+    handler that fails outright costs the sender an error frame rather than
+    their connection
 
     :param app: application holding the rooms, sockets and clock
     :param websocket: accepted socket for this player
@@ -170,7 +172,16 @@ async def _ws_session(app: FastAPI, websocket: WebSocket, room_id: str) -> None:
                 await send(websocket, ErrorMessage(reason=Reason.RATE_LIMITED))
                 continue
             t0 = app.state.now()
-            msg_type, outcome = await dispatch(app, websocket, room, current_color, raw)
+            try:
+                msg_type, outcome = await dispatch(
+                    app, websocket, room, current_color, raw)
+            except Exception:
+                failed_type = peek_type(raw)
+                log.exception("ws dispatch failed room=%s color=%s type=%s",
+                              room.room_id, current_color,
+                              failed_type if failed_type in HANDLERS else "unknown")
+                await send(websocket, ErrorMessage(reason=Reason.INVALID_MESSAGE))
+                continue
             log.debug("ws dispatch room=%s uuid=%s type=%s latency_ms=%.1f outcome=%s",
                       room.room_id, auth_uuid[:8], msg_type,
                       (app.state.now() - t0) * 1000.0, outcome)

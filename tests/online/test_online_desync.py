@@ -25,10 +25,10 @@ from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import square_from_coord
 from chessshootout.server import connections as connections_module
 from chessshootout.server.app import create_app
-from chessshootout.server.handlers import (
-    RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
+from chessshootout.server.protocol import (
+    MoveAppliedMessage, PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
+    RESYNC_TRANSIT_GRACE_SECONDS,
 )
-from chessshootout.server.protocol import MoveAppliedMessage, PROTOCOL_VERSION
 from tests.helpers import FakeClock, fake_uuid4, read_source_without_docstrings
 
 

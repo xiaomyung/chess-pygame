@@ -13,7 +13,7 @@ from chessshootout.backend.pieces import PieceColor
 from chessshootout.backend.utils import Square
 from chessshootout.server.protocol import (
     GRACE_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, IDLE_WINDOW_BY_PLIES, IdleWindowSpec,
-    Reason,
+    RESYNC_STRIKE_TTL_SECONDS, Reason,
 )
 from chessshootout.skillcheck import online
 from chessshootout.skillcheck.types import SkillCheckKind, SkillCheckOutcome
@@ -105,8 +105,55 @@ class PlayerSlot:
     disconnected_at: float | None = None
     desync_active: bool = False
     ply_mismatch_streak: int = 0
+    last_strike_at: float | None = None
+    resync_logged: bool = False
     last_seen: float = 0.0
     at_result: bool = False
+
+    def strike(self, now: float) -> int:
+        """
+        Count one heartbeat that reported the wrong ply and say how many have
+        now landed in a row. Strikes expire: two that are further apart than
+        RESYNC_STRIKE_TTL_SECONDS describe two separate hiccups rather than one
+        board that is stuck, so the later one starts a fresh streak
+
+        :param now: monotonic seconds the heartbeat was judged at.
+        :returns: the streak this strike belongs to, counting itself.
+        """
+        if (self.last_strike_at is None
+                or now - self.last_strike_at > RESYNC_STRIKE_TTL_SECONDS):
+            self.ply_mismatch_streak = 1
+        else:
+            self.ply_mismatch_streak += 1
+        self.last_strike_at = now
+        return self.ply_mismatch_streak
+
+    def clear_strikes(self) -> None:
+        """
+        Spend whatever strikes stand against this seat, which is what proof of
+        a healthy board -- or an order that has just been sent -- buys. The
+        lagging spell itself is untouched, so a repair still in progress stays
+        reported as one
+        """
+        self.ply_mismatch_streak = 0
+        self.last_strike_at = None
+
+    def mark_desynced(self) -> None:
+        """
+        Note that this seat is rebuilding its game state, the flag the opponent
+        notification and the once-per-spell operator line both hang off
+        """
+        self.desync_active = True
+
+    def end_resync_spell(self) -> None:
+        """
+        Close a lagging spell: no strikes stand, the seat is no longer counted
+        as rebuilding, and the next spell may log its own operator line. Every
+        place that decides a player is caught up goes through here
+        """
+        self.clear_strikes()
+        self.desync_active = False
+        self.resync_logged = False
 
 
 @dataclass
@@ -744,8 +791,7 @@ class RoomManager:
         if slot is not None:
             slot.connected = True
             slot.disconnected_at = None
-            slot.desync_active = False
-            slot.ply_mismatch_streak = 0
+            slot.end_resync_spell()
             slot.last_seen = self._now()
 
     def mark_disconnected(self, room_id: str, color: str) -> None:
@@ -1054,7 +1100,7 @@ class RoomManager:
         for slot in (room.white, room.black):
             if slot is not None:
                 slot.at_result = False
-                slot.ply_mismatch_streak = 0
+                slot.end_resync_spell()
         return True
 
     @staticmethod

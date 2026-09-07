@@ -287,15 +287,14 @@ class _UrlBuilder:
         return f"{self.ws_scheme}://{self.host}:{self.port}{path}"
 
 
-def _error_body(response: httpx.Response) -> dict[str, Any] | None:
+def _decoded_body(response: httpx.Response) -> dict[str, Any] | None:
     """
-    Decode the object an error response carries its rejection details in,
-    whether the server nested them under a detail key or sent them plain. An
-    error body is reachable by anything sitting between client and server, so a
-    body that does not decode into an object at all yields nothing
+    Decode an error response's body as the object it should be. An error body
+    is reachable by anything sitting between client and server, so a body that
+    is not JSON, or is JSON that is not an object, yields nothing at all
 
     :param response: the failed response, body not yet decoded.
-    :returns: the details object, or None when the body carries none.
+    :returns: the decoded object, or None when the body is not one.
     """
     try:
         body = _loads(response.content)
@@ -303,32 +302,62 @@ def _error_body(response: httpx.Response) -> dict[str, Any] | None:
         return None
     if not isinstance(body, dict):
         return None
+    return cast("dict[str, Any]", body)
+
+
+def _error_body(response: httpx.Response) -> dict[str, Any] | None:
+    """
+    Decode the object an error response carries its rejection details in,
+    whether the server nested them under a detail key or sent them plain, so a
+    reason and the fields beside it are read out of one and the same object
+
+    :param response: the failed response, body not yet decoded.
+    :returns: the details object, or None when the body carries none.
+    """
+    body = _decoded_body(response)
+    if body is None:
+        return None
     detail = body.get("detail")
     if isinstance(detail, dict):
         return cast("dict[str, Any]", detail)
-    return cast("dict[str, Any]", body)
+    return body
+
+
+def _reason_from_body(body: dict[str, Any]) -> str | None:
+    """
+    Read the server's reason code out of an already decoded details object,
+    accepting both the plain reason field and a detail that is only a sentence
+
+    :param body: the details object the refusal was decoded into.
+    :returns: the reason code, or None when the object carries none.
+    """
+    reason = body.get("reason")
+    if isinstance(reason, str):
+        return reason
+    detail = body.get("detail")
+    return detail if isinstance(detail, str) else None
 
 
 def _safe_error_reason(response: httpx.Response) -> str | None:
     """
-    Dig the server's reason code out of an error response, accepting both the
-    plain reason field and a detail that is only a sentence. Anything
-    unreadable yields no reason at all and the caller falls back to naming the
-    status
+    Dig the server's reason code out of an error response: the reason stated at
+    the top level answers first, and only then is a nested detail looked into.
+    Anything unreadable yields no reason at all and the caller falls back to
+    naming the status
 
     :param response: the failed response, body not yet decoded.
     :returns: the reason code, or None when the body carries none.
     """
-    body = _error_body(response)
+    body = _decoded_body(response)
     if body is None:
         return None
     reason = body.get("reason")
     if isinstance(reason, str):
         return reason
     detail = body.get("detail")
-    if isinstance(detail, str):
-        return detail
-    return None
+    if isinstance(detail, dict):
+        return _reason_from_body(cast("dict[str, Any]", detail))
+    return detail if isinstance(detail, str) else None
 
 
 class ServerTransport:
@@ -499,10 +528,11 @@ class ServerTransport:
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             raise TransportError(str(exc)) from exc
         if r.status_code == 426:
-            reason = _safe_error_reason(r)
+            body = _error_body(r) or {}
+            reason = _reason_from_body(body)
             if reason != Reason.CLIENT_OUTDATED:
                 raise SchemaVersionMismatch(reason or Reason.VERSION_MISMATCH)
-            minimum = (_error_body(r) or {}).get("min_version")
+            minimum = body.get("min_version")
             raise ClientOutdated(reason,
                                  min_version=minimum if isinstance(minimum, str) else "")
         if r.status_code >= 400:
