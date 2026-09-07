@@ -79,9 +79,9 @@ def test_parse_caps_at_news_max_items_keeping_the_newest():
 
 
 def test_the_shipped_feed_fits_under_the_cap_and_parses_whole():
-    # The published feed only ever grows. A cap below its length would silently
-    # drop the oldest items from the News card, and a malformed entry would
-    # vanish the same way, so pin both against the real file.
+    """The published feed only ever grows. A cap below its length would silently
+    drop the oldest items from the News card, and a malformed entry would vanish
+    the same way, so pin both against the real file."""
     feed = Path(chessshootout.__file__).resolve().parent.parent / "news.json"
     raw = json.loads(feed.read_text(encoding="utf-8"))
     assert len(parse_news_items(raw)) == len(raw)

@@ -16,16 +16,7 @@ from chessshootout.skillcheck import online
 from chessshootout.skillcheck.triggers import compute_facts
 from chessshootout.skillcheck.types import SkillCheckKind, SkillCheckOutcome
 from tests.helpers import fake_uuid4
-
-
-def _wait_for(client, type_name, timeout=15.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for ev in client.drain_inbound():
-            if ev.type == type_name:
-                return ev
-        time.sleep(0.02)
-    return None
+from tests.online.online_helpers import wait_for
 
 
 def _pair(addr, white_uuid, black_uuid):
@@ -37,8 +28,8 @@ def _pair(addr, white_uuid, black_uuid):
     b.connect(addr, {"nickname": "Bob", "client_uuid": black_uuid,
                      "time_minutes": 5, "increment_seconds": 0,
                      "side_preference": "black"})
-    assert _wait_for(a, "game_start") is not None
-    assert _wait_for(b, "game_start") is not None
+    assert wait_for(a, "game_start") is not None
+    assert wait_for(b, "game_start") is not None
     return a, b
 
 
@@ -133,8 +124,8 @@ def _force_aim(room):
 
 def _move(mover, a, b, frm, to):
     mover.send_move(frm, to)
-    assert _wait_for(a, "move_applied") is not None
-    assert _wait_for(b, "move_applied") is not None
+    assert wait_for(a, "move_applied") is not None
+    assert wait_for(b, "move_applied") is not None
 
 
 def _reach_capture(a, b, app, force=_force_wheel):
@@ -143,8 +134,8 @@ def _reach_capture(a, b, app, force=_force_wheel):
     room = _room(app)
     force(room)
     a.send_move("e4", "d5")               # 2. exd5 -> fires the check
-    req = _wait_for(a, "skill_check_required")
-    spec = _wait_for(b, "skill_check_spectate")
+    req = wait_for(a, "skill_check_required")
+    spec = wait_for(b, "skill_check_spectate")
     assert req is not None and spec is not None, "the check did not fire over the wire"
     return room, req.payload, spec.payload
 
@@ -168,8 +159,8 @@ def test_a_won_check_applies_the_move_and_records_the_win(server_with_app):
     elapsed = _winning_elapsed(req)
     time.sleep((elapsed - _SLEEP_LEAD_MS) / 1000.0)  # land in [E, E+lag_bound] -> scored at E
     a.send_skill_check_shot(elapsed)
-    a_applied = _wait_for(a, "move_applied")
-    b_applied = _wait_for(b, "move_applied")
+    a_applied = wait_for(a, "move_applied")
+    b_applied = wait_for(b, "move_applied")
     assert a_applied.payload["san"] == "exd5"
     assert a_applied.payload["skill_check_kind"] == "wheel"
     assert a_applied.payload["skill_check_won"] is True
@@ -184,8 +175,8 @@ def test_a_failed_check_locks_the_move_and_records_the_whiff(server_with_app):
     a, b = _pair("localhost:{}".format(port), fake_uuid4(25), fake_uuid4(26))
     room, req, spec = _reach_capture(a, b, app)
     a.send_skill_check_shot(0)  # an immediate sub-floor shot fails the one-shot wheel
-    a_result = _wait_for(a, "skill_check_result")
-    b_result = _wait_for(b, "skill_check_result")
+    a_result = wait_for(a, "skill_check_result")
+    b_result = wait_for(b, "skill_check_result")
     assert a_result.payload["won"] is False
     assert b_result.payload["won"] is False, "the opponent is told the verdict too"
     assert (Square(4, 4), Square(3, 3)) in room.skillcheck_locks, "the move is greyed"
@@ -203,8 +194,8 @@ def test_resume_after_a_won_check_carries_the_skillcheck_log(server_with_app):
     elapsed = _winning_elapsed(req)
     time.sleep((elapsed - _SLEEP_LEAD_MS) / 1000.0)  # land in [E, E+lag_bound] -> scored at E
     a.send_skill_check_shot(elapsed)
-    assert _wait_for(a, "move_applied") is not None
-    assert _wait_for(b, "move_applied") is not None
+    assert wait_for(a, "move_applied") is not None
+    assert wait_for(b, "move_applied") is not None
     payload = fetch_resume(addr, a._room_id, a._session_token)
     assert payload["skillcheck_log"] == [
         {"ply": 3, "kind": "wheel", "won": True, "san": "exd5"}]

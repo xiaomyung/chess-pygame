@@ -41,10 +41,9 @@ from chessshootout.server.protocol import (
 from chessshootout.server.rooms import HISTORY_CHANGE_WINDOW, PendingSkillCheck
 from chessshootout.skillcheck.types import SkillCheckKind
 from tests.helpers import read_source_without_docstrings
-from tests.server.conftest import ALICE, BOB
-from tests.server.test_server_broadcasts import RecordingWS
-from tests.server.test_server_skillcheck import (
-    _capture_room, _fire, _move_raw as _capture_move_raw, _win_elapsed,
+from tests.server.conftest import (
+    RecordingWS, capture_room, fire, move_raw as capture_move_raw, pair_room,
+    win_elapsed,
 )
 
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(chessshootout.__file__))
@@ -55,6 +54,7 @@ HISTORY_CALL_NAMES = {"try_move", "promote", "undo", "new_game", "Backend"}
 HISTORY_MUTATORS = {"_apply_move", "handle_takeback_response", "enqueue",
                     "reset_for_rematch"}
 SKILLCHECK_HOLD_MS = 5000.0
+MODULE_LEVEL = "<module>"
 
 PING_OUTCOMES = (
     "ping", "ping_pending", "ping_pregame", "ping_offboard",
@@ -65,12 +65,7 @@ PING_OUTCOMES = (
 async def _paired(app, clock):
     """A paired room with both seats wired to a recording socket, nothing
     announced yet: this is the pre-game window layer 2 protects."""
-    rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(app.state.rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.white.connected = True
@@ -191,12 +186,21 @@ async def test_two_plies_in_one_instant_both_stay_excused(app, clock):
 
 async def test_the_stamp_window_keeps_the_most_recent_changes(app, clock):
     """The deque is bounded, so a long game cannot grow it; the bound has to be
-    generous enough that the oldest entry it drops is far outside the grace."""
+    generous enough that the oldest entry it drops is far outside the grace. The
+    stamps carry distinguishable prev_lens, so this pins WHICH end is dropped:
+    the oldest goes and the newest stays, which is the only order that keeps the
+    in-flight check looking at recent history."""
     room, ws_w, ws_b = await _live_room(app, clock)
-    for _ in range(HISTORY_CHANGE_WINDOW + 4):
-        room.note_history_change(clock(), 0)
+    room.history_changes.clear()
+    overflow = 4
+    for i in range(HISTORY_CHANGE_WINDOW + overflow):
+        room.note_history_change(clock(), i)
 
     assert len(room.history_changes) == HISTORY_CHANGE_WINDOW
+    kept = [change.prev_len for change in room.history_changes]
+    assert kept == list(range(overflow, HISTORY_CHANGE_WINDOW + overflow))
+    assert 0 not in kept, "the oldest stamp is the one evicted"
+    assert kept[-1] == HISTORY_CHANGE_WINDOW + overflow - 1, "the newest is kept"
 
 
 async def test_a_rematch_starts_from_a_clean_stamp_and_streak(app, clock):
@@ -224,13 +228,13 @@ async def test_a_won_skill_check_stamps_the_history_like_a_quiet_move(app, clock
     stamps too. Without that, the whole verdict flourish -- during which the
     client deliberately sends no heartbeat -- would be followed by a first
     heartbeat that looks a ply behind."""
-    room, ws_w, ws_b, frm, to = await _capture_room(app, clock, SkillCheckKind.WHEEL)
+    room, ws_w, ws_b, frm, to = await capture_room(app, clock, SkillCheckKind.WHEEL)
     await broadcast_game_start(app.state.connections, room, clock)
     clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
-    await handle_move(app, ws_w, room, "white", _capture_move_raw(frm, to))
+    await handle_move(app, ws_w, room, "white", capture_move_raw(frm, to))
     pending = room.pending_skillcheck
 
-    assert await _fire(app, clock, room, "white", _win_elapsed(pending)) == "applied"
+    assert await fire(app, clock, room, "white", win_elapsed(pending)) == "applied"
     assert len(room.backend.move_history) == 1
     assert await handle_ping(app, ws_b, room, "black", _ping_raw(0)) == "ping_inflight"
 
@@ -248,6 +252,25 @@ async def test_a_heartbeat_is_not_judged_before_the_game_is_announced(app, clock
     assert _directives(ws_w) == []
     assert room.white.desync_active is False
     assert room.white.ply_mismatch_streak == 0
+
+
+async def test_the_game_start_stamp_excuses_any_ply_only_while_it_is_fresh(app, clock):
+    """The game-start stamp records no previous length, so while it is fresh it
+    forgives ANY ply -- the announcement has just gone out and nothing is known
+    about the board the client was on before it. That blanket is a window like
+    every other stamp: once it ages past the transit grace the same wrong ply is
+    judged, or a client that never adopted the new game would be excused for the
+    whole match."""
+    room, ws_w, ws_b = await _paired(app, clock)
+    await broadcast_game_start(app.state.connections, room, clock)
+
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_inflight"
+    assert room.white.ply_mismatch_streak == 0, "an excused ping is not a strike"
+
+    clock.advance(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
+
+    assert await handle_ping(app, ws_w, room, "white", _ping_raw(7)) == "ping_strike"
+    assert room.white.ply_mismatch_streak == 1
 
 
 async def test_a_client_off_the_board_reports_no_ply_and_earns_no_strike(app, clock):
@@ -783,10 +806,20 @@ class _HistoryCallVisitor(ast.NodeVisitor):
     is written in. A nested def is a def of its own, so the visitor descends
     into it under its own name rather than crediting the outer one -- plain
     ast.walk cannot express that, since skipping a nested FunctionDef in the
-    loop body does not stop walk() from yielding everything inside it."""
+    loop body does not stop walk() from yielding everything inside it.
 
-    def __init__(self):
-        """Start with no enclosing def and nothing filed."""
+    A call written at module level or straight in a class body has no enclosing
+    def, and is filed under MODULE_LEVEL rather than dropped: a Backend built at
+    import time mutates a history nobody stamps, and silently ignoring it is how
+    the guard would miss the one site it cannot see."""
+
+    def __init__(self, module):
+        """Start with no enclosing def and nothing filed.
+
+        The module name is carried so every site is keyed by where it lives as
+        well as what it is called: two modules may spell the same def name, and
+        the failure message has to say which one grew a call."""
+        self.module = module
         self.sites = {}
         self._enclosing = None
 
@@ -806,15 +839,16 @@ class _HistoryCallVisitor(ast.NodeVisitor):
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) \
             else getattr(func, "id", None)
-        if name in HISTORY_CALL_NAMES and self._enclosing is not None:
-            self.sites.setdefault(self._enclosing, []).append(node.lineno)
+        if name in HISTORY_CALL_NAMES:
+            key = (self.module, self._enclosing or MODULE_LEVEL)
+            self.sites.setdefault(key, []).append(node.lineno)
         self.generic_visit(node)
 
 
 def _history_call_sites(path):
-    """Enclosing def name for every call that can change a Backend's move
-    history, keyed by name because that is what a new site would be spelled as."""
-    visitor = _HistoryCallVisitor()
+    """Every call that can change a Backend's move history, keyed by the module
+    and the def it is written in -- MODULE_LEVEL when it is written in neither."""
+    visitor = _HistoryCallVisitor(os.path.basename(path))
     visitor.visit(ast.parse(read_source_without_docstrings(path), filename=path))
     return visitor.sites
 
@@ -836,9 +870,10 @@ def test_only_the_four_stamping_functions_touch_the_move_history():
             if not name.endswith(".py"):
                 continue
             scanned += 1
-            for fn_name, lines in _history_call_sites(
+            for key, lines in _history_call_sites(
                     os.path.join(dirpath, name)).items():
-                found.setdefault(fn_name, []).extend(lines)
+                found.setdefault(key, []).extend(lines)
     assert scanned >= 8, f"only scanned {scanned} files, guard root is likely wrong"
-    assert set(found) == HISTORY_MUTATORS, (
-        f"move_history is mutated outside the stamping functions: {sorted(found)}")
+    assert {fn_name for _, fn_name in found} == HISTORY_MUTATORS, (
+        "move_history is mutated outside the stamping functions: "
+        f"{sorted(found)}")

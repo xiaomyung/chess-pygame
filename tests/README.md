@@ -182,7 +182,8 @@ when it is long or reused.
 Production code follows the repo-wide docstring + annotation standard
 (CONTRIBUTING.md, "Docstrings and types"), enforced by
 `tests/infra/test_docstring_guard.py` and mypy strict in CI. The shared
-test-infra modules (`helpers.py`, the conftests, `focus_helpers.py`) follow the
+test-infra modules (`helpers.py`, the conftests, `focus_helpers.py`,
+`online_helpers.py`) follow the
 same standard; ordinary test functions need docstrings only where rationale
 lives (see above). Guards that scan source text read it through
 `helpers.read_source_without_docstrings`, so prose in docstrings can never trip
@@ -207,8 +208,15 @@ a code-shape tripwire — never scan raw file text in a new guard.
   millisecond stand-in, distinct from `helpers.FakeClock`'s server-side seconds
   clock) — import it as `from tests.frontend.focus_helpers import ...`.
 - `tests/server/conftest.py` holds the server-only `clock`/`app`/`client` fixture
-  trio, `ALICE`/`BOB`, and `auth_msg` — auto-scoped to `tests/server/` so it
-  can't shadow a client-side test's own `app`/`client` names.
+  trio, `ALICE`/`BOB`, and the shared server test doubles — `RecordingWS`,
+  `pair_room()`, the skill-check factories (`capture_room`, `fire`, `win_elapsed`,
+  `move_raw`, `shot_raw`, `seed_for`, `capture_backend`), `KV_TOKEN_RE` and
+  `assert_sweep_clean()` — plus a re-export of `helpers.auth_msg`. Auto-scoped to
+  `tests/server/` so it can't shadow a client-side test's own `app`/`client`
+  names; server test modules import shared helpers from here, never from each
+  other.
+- `tests/online/online_helpers.py` holds `wait_for` / `collect_for`, the two
+  polling waits every end-to-end online test needs.
 - `tests/server/moderation_helpers.py` is the moderation suite's own builder set
   (pattern-library readers, canonical/transformed constructions, and the
   worst-case dense-but-clean arrow store the CPU timing pin measures) — import

@@ -20,7 +20,7 @@ from chessshootout.server.connections import broadcast
 from chessshootout.server.protocol import PROTOCOL_VERSION, Reason, ResultMessage
 from chessshootout.server.rooms import RoomManager
 from tests.helpers import read_source_without_docstrings
-from tests.server.conftest import ALICE, BOB
+from tests.server.conftest import ALICE, RecordingWS, pair_room
 
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(chessshootout.__file__))
 REPO_ROOT = os.path.dirname(PACKAGE_ROOT)
@@ -28,32 +28,9 @@ SERVER_ROOT = os.path.join(PACKAGE_ROOT, "server")
 FINALIZE_CALLER = "chessshootout/server/broadcasts.py"
 
 
-class RecordingWS:
-    def __init__(self):
-        self.sent = []
-        self.closed_with = None
-
-    async def send_json(self, payload):
-        self.sent.append(payload)
-
-    async def close(self, code=1000):
-        self.closed_with = code
-
-    def of_type(self, t):
-        return [m for m in self.sent if m["type"] == t]
-
-
 class FailingWS:
     async def send_json(self, payload):
         raise RuntimeError("connection reset")
-
-
-async def _pair(rooms):
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    return list(rooms._active.values())[0]
 
 
 class _RacingWS(RecordingWS):
@@ -81,7 +58,7 @@ class _RacingWS(RecordingWS):
 async def test_losing_finalize_race_does_not_double_broadcast(app, clock):
     rooms = app.state.rooms
     connections = app.state.connections
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     racing_white = _RacingWS(rooms, connections, room)
     ws_black = RecordingWS()
@@ -105,7 +82,7 @@ async def test_losing_finalize_race_does_not_double_broadcast(app, clock):
 async def test_broadcast_marks_disconnected_on_send_failure(app, clock):
     rooms = app.state.rooms
     connections = app.state.connections
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     rooms.mark_connected(room.room_id, "white")
     rooms.mark_connected(room.room_id, "black")
@@ -129,7 +106,7 @@ async def test_broadcast_send_failure_to_an_already_disconnected_slot_is_a_noop(
     fresh disconnected_at over the real one."""
     rooms = app.state.rooms
     connections = app.state.connections
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     connections.add(room.room_id, room.white.client_uuid, FailingWS())
 
@@ -221,7 +198,7 @@ async def test_one_game_finalized_line_per_game_however_often_finalize_is_called
     late resign, sweep tick or reconnect racing an already-ended game would
     file a fresh ending in the journal."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     room.plies_ever = 3
     connections = app.state.connections
@@ -245,7 +222,7 @@ async def test_the_finalize_that_loses_the_race_logs_nothing(app, clock, caplog)
     more than it reaches the players."""
     rooms = app.state.rooms
     connections = app.state.connections
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     room.plies_ever = 5
     connections.add(room.room_id, room.white.client_uuid,
@@ -289,7 +266,7 @@ async def test_a_zero_ply_abort_logs_the_rewritten_reason_and_the_wait(
     game" and "a pairing never got going", which is what an operator reads the
     field for. duration_s counts from pairing, so it is the whole wait."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     connections = app.state.connections
     connections.add(room.room_id, room.white.client_uuid, RecordingWS())
     clock.advance(45.25)

@@ -10,6 +10,7 @@ import time
 
 from chessshootout.online.client import OnlineClient
 from tests.helpers import fake_uuid4
+from tests.online.online_helpers import wait_for
 
 
 ALICE = fake_uuid4(1)
@@ -33,17 +34,6 @@ def _drain(client, timeout=15.0):
     return seen
 
 
-def _wait_for(client, type_name, timeout=15.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        events = client.drain_inbound()
-        for ev in events:
-            if ev.type == type_name:
-                return ev
-        time.sleep(0.05)
-    return None
-
-
 def test_two_clients_pair_and_play_a_move(server):
     addr = f"localhost:{server}"
     a = OnlineClient()
@@ -55,21 +45,21 @@ def test_two_clients_pair_and_play_a_move(server):
                       "time_minutes": 5, "increment_seconds": 0,
                       "side_preference": "black"})
 
-    a_game = _wait_for(a, "game_start")
-    b_game = _wait_for(b, "game_start")
+    a_game = wait_for(a, "game_start")
+    b_game = wait_for(b, "game_start")
     assert a_game is not None and b_game is not None
     assert a_game.payload["your_color"] == "white"
     assert b_game.payload["your_color"] == "black"
 
     a.send_move("e2", "e4")
-    a_applied = _wait_for(a, "move_applied")
-    b_applied = _wait_for(b, "move_applied")
+    a_applied = wait_for(a, "move_applied")
+    b_applied = wait_for(b, "move_applied")
     assert a_applied.payload["san"] == "e4"
     assert b_applied.payload["san"] == "e4"
 
     b.send_move("e7", "e5")
-    a_applied2 = _wait_for(a, "move_applied")
-    b_applied2 = _wait_for(b, "move_applied")
+    a_applied2 = wait_for(a, "move_applied")
+    b_applied2 = wait_for(b, "move_applied")
     assert a_applied2.payload["san"] == "e5"
     assert b_applied2.payload["san"] == "e5"
 
@@ -87,15 +77,15 @@ def test_resign_broadcasts_result_to_both_clients(server):
     b.connect(addr, {"nickname": "Bob", "client_uuid": BOB2,
                       "time_minutes": 5, "increment_seconds": 0,
                       "side_preference": "black"})
-    _wait_for(a, "game_start")
-    _wait_for(b, "game_start")
+    wait_for(a, "game_start")
+    wait_for(b, "game_start")
 
     a.send_move("e2", "e4")
-    _wait_for(a, "move_applied")
-    _wait_for(b, "move_applied")
+    wait_for(a, "move_applied")
+    wait_for(b, "move_applied")
     a.send_resign()
-    a_result = _wait_for(a, "result")
-    b_result = _wait_for(b, "result")
+    a_result = wait_for(a, "result")
+    b_result = wait_for(b, "result")
     assert a_result.payload["reason"] == "resignation"
     assert a_result.payload["winner_color"] == "black"
     assert b_result.payload["reason"] == "resignation"
@@ -115,17 +105,17 @@ def test_online_rematch_swaps_colors(server):
     b.connect(addr, {"nickname": "Bob", "client_uuid": BOB3,
                       "time_minutes": 5, "increment_seconds": 0,
                       "side_preference": "black"})
-    assert _wait_for(a, "game_start").payload["your_color"] == "white"
-    assert _wait_for(b, "game_start").payload["your_color"] == "black"
+    assert wait_for(a, "game_start").payload["your_color"] == "white"
+    assert wait_for(b, "game_start").payload["your_color"] == "black"
 
     a.send_resign()
-    _wait_for(a, "result")
-    _wait_for(b, "result")
+    wait_for(a, "result")
+    wait_for(b, "result")
 
     a.send_rematch_request()
     b.send_rematch_request()
-    a_game2 = _wait_for(a, "game_start")
-    b_game2 = _wait_for(b, "game_start")
+    a_game2 = wait_for(a, "game_start")
+    b_game2 = wait_for(b, "game_start")
     assert a_game2 is not None and b_game2 is not None
     assert a_game2.payload["your_color"] == "black"
     assert b_game2.payload["your_color"] == "white"

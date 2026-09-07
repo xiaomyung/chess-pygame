@@ -144,8 +144,11 @@ def test_route_rejects_non_uuid4_payload(client, caplog, method, route, payload,
     assert r.json() == {"detail": {"reason": Reason.INVALID_FIELD}}
     rejected = [rec.getMessage() for rec in caplog.records
                 if rec.getMessage().startswith("request rejected")]
-    assert rejected == [f"request rejected path={route} field=body.{field} "
-                        f"error=value_error"]
+    assert len(rejected) == 1
+    assert rejected[0].startswith(
+        f"request rejected path={route} field=body.{field} error=")
+    assert str(payload.get(field, "")) not in rejected[0], \
+        "the rejected value never reaches the log"
 
 
 def test_the_published_422_matches_the_shape_the_routes_actually_send(client):

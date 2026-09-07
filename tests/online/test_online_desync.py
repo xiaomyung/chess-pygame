@@ -29,7 +29,9 @@ from chessshootout.server.protocol import (
     MoveAppliedMessage, PROTOCOL_VERSION, RESYNC_STABLE_MISMATCH_HEARTBEATS,
     RESYNC_TRANSIT_GRACE_SECONDS,
 )
-from tests.helpers import FakeClock, fake_uuid4, read_source_without_docstrings
+from tests.helpers import (
+    FakeClock, auth_msg, fake_uuid4, read_source_without_docstrings,
+)
 
 
 ALICE = fake_uuid4(1)
@@ -63,10 +65,6 @@ def _matchmake(client, *, uuid, nickname, side):
     }).json()
 
 
-def _auth(token):
-    return {"version": PROTOCOL_VERSION, "type": "auth", "session_token": token}
-
-
 def _move(from_sq, to_sq):
     return {"version": PROTOCOL_VERSION, "type": "move",
             "from": from_sq, "to": to_sq}
@@ -91,9 +89,9 @@ def _recv_type(ws, msg_type):
 def test_move_applied_includes_ply(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -111,9 +109,9 @@ def test_move_applied_includes_ply(client):
 def test_takeback_applied_includes_ply(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -137,9 +135,9 @@ def test_takeback_applied_includes_ply(client):
 def test_dropped_broadcast_pushes_reconnecting_to_surviving_peer(client, monkeypatch):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
 
@@ -187,9 +185,9 @@ def _past_the_transit_grace(clock):
 def test_ping_with_matching_ply_pongs_without_directive(client, clock):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -204,9 +202,9 @@ def test_ping_with_wrong_ply_directs_resync_and_flags_opponent(client, clock):
     one only earns a pong."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -228,9 +226,9 @@ def test_a_heartbeat_racing_the_opponents_move_is_not_a_desync(client, clock):
     simply has not arrived yet."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -252,9 +250,9 @@ def test_a_heartbeat_racing_a_takeback_is_not_a_desync(client, clock):
     one-directional tolerance."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -313,9 +311,9 @@ def test_flapping_ping_notifies_the_opponent_once_per_window(client, clock):
 
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -346,9 +344,9 @@ def test_a_pure_ply_alternation_costs_the_opponent_nothing(client, clock):
     gate, and nothing reaches the client either."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -370,9 +368,9 @@ def test_flapping_ping_cannot_amplify_resync_directives(client, clock):
     is untouched."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -411,9 +409,9 @@ def test_sustained_desync_keeps_directing_resync_promptly(client, clock):
 
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             _past_the_transit_grace(clock)
@@ -442,15 +440,15 @@ def test_reconnecting_client_gets_opponent_present_snapshot(client):
     presence, so a client that dropped can't be stuck showing the opponent red."""
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-        ws_b.send_text(json.dumps(_auth(b["session_token"])))
+        ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
         with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-            ws_w.send_text(json.dumps(_auth(a["session_token"])))
+            ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
             ws_w.receive_text()                       # game_start
             ws_b.receive_text()                       # game_start
         # white dropped -> black is told "reconnecting"; drain it
         assert json.loads(ws_b.receive_text())["type"] == "connection_status"
         with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w2:
-            ws_w2.send_text(json.dumps(_auth(a["session_token"])))
+            ws_w2.send_text(json.dumps(auth_msg(a["session_token"])))
             snap = json.loads(ws_w2.receive_text())
             assert snap["type"] == "connection_status"
             assert snap["opp_state"] == "connected", "opponent b is still here"
@@ -459,14 +457,14 @@ def test_reconnecting_client_gets_opponent_present_snapshot(client):
 def test_reconnecting_client_told_opponent_still_gone(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()                       # game started, both present
         # black dropped inside; now white drops too
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w2:
-        ws_w2.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w2.send_text(json.dumps(auth_msg(a["session_token"])))
         snap = json.loads(ws_w2.receive_text())
         assert snap["type"] == "connection_status"
         assert snap["opp_state"] == "reconnecting", "opponent is still gone"
@@ -475,9 +473,9 @@ def test_reconnecting_client_told_opponent_still_gone(client):
 def test_new_matchmake_abandons_in_progress_game(client):
     a, b = _paired_ws(client)
     with client.websocket_connect(f"/ws/{a['room_id']}") as ws_w:
-        ws_w.send_text(json.dumps(_auth(a["session_token"])))
+        ws_w.send_text(json.dumps(auth_msg(a["session_token"])))
         with client.websocket_connect(f"/ws/{b['room_id']}") as ws_b:
-            ws_b.send_text(json.dumps(_auth(b["session_token"])))
+            ws_b.send_text(json.dumps(auth_msg(b["session_token"])))
             ws_w.receive_text()
             ws_b.receive_text()
             ws_w.send_text(json.dumps(_move("e2", "e4")))
@@ -1137,9 +1135,10 @@ def test_a_live_online_board_reports_its_own_ply():
 def test_a_client_on_another_screen_claims_no_ply():
     """The heartbeat keeps running from the menu, the history view and the
     review screen. Reporting the game screen's ply from there is a claim about
-    a board nobody is looking at."""
+    a board nobody is looking at. Navigating for real (rather than assigning
+    app.screen) keeps the claim tied to the way a player actually leaves."""
     app = _online_app()
-    app.screen = app.menu
+    app.switch_to("menu")
 
     assert app.coordinator._heartbeat_ply() is None
 

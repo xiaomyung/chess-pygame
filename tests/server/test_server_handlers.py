@@ -25,17 +25,12 @@ from chessshootout.server.protocol import (
 )
 from chessshootout.server.rooms import PendingSkillCheck
 from chessshootout.skillcheck.types import SkillCheckKind
-from tests.server.conftest import ALICE, BOB
-from tests.server.test_server_broadcasts import RecordingWS
+from tests.server.conftest import RecordingWS, pair_room
 
 
 async def _wired_room(app):
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms)
     ws_w, ws_b = RecordingWS(), RecordingWS()
     app.state.connections.add(room.room_id, room.white.client_uuid, ws_w)
     app.state.connections.add(room.room_id, room.black.client_uuid, ws_b)

@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import sys
+import time
 
 import pytest
 
@@ -12,9 +13,10 @@ from fastapi.testclient import TestClient
 from slowapi import Limiter
 
 from chessshootout.server import app as app_module
+from chessshootout.server import routes_http
 from chessshootout.server.app import _sweep_loop, create_app
-from chessshootout.server.limits import MATCHMAKE_PER_IP_LIMIT, UuidRateLimiter
-from chessshootout.server.limits import MAX_INBOUND_MESSAGE_BYTES
+from chessshootout.server.limits import (
+    MATCHMAKE_PER_IP_LIMIT, MAX_INBOUND_MESSAGE_BYTES, UuidRateLimiter)
 from chessshootout.server.broadcasts import broadcast_game_start, idle_window_wire
 from chessshootout.server.connections import ConnectionRegistry
 from chessshootout.server.handlers import (
@@ -34,13 +36,26 @@ from chessshootout.server.protocol import (
 from chessshootout.server.rooms import QUEUE_ABANDON_SECONDS, RoomManager
 from chessshootout.server.sweep import SWEEP_STALE_SECONDS, Sweep
 from tests.helpers import FakeClock, fake_uuid4
-from tests.server.conftest import ALICE, BOB, auth_msg
-from tests.server.test_server_broadcasts import RecordingWS
-from tests.server.test_server_logging import KV_TOKEN_RE
+from tests.server.conftest import (
+    ALICE, BOB, KV_TOKEN_RE, RecordingWS, auth_msg, pair_room)
+
+
+TINY_PER_IP_LIMIT = "2/minute"
+TINY_BUDGET = 2
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 
 async def _sweep(app):
     await app.state.sweep.step_all()
+
+
+def _client_on_a_tiny_matchmake_budget(monkeypatch):
+    """An app whose per-IP matchmake allowance is TINY_PER_IP_LIMIT. The limit
+    string is read when build_http_router runs, once per create_app, so patching
+    it before building proves the decorator binding in two requests rather than
+    sixty."""
+    monkeypatch.setattr(routes_http, "MATCHMAKE_PER_IP_LIMIT", TINY_PER_IP_LIMIT)
+    return TestClient(create_app(now_provider=FakeClock(), max_rooms=8))
 
 
 def test_registry_add_returns_displaced_socket():
@@ -79,7 +94,8 @@ APP_STATE_TYPES = {
     "sweep": Sweep,
 }
 PER_APP_OBJECTS = ("rooms", "connections", "limiter", "reclaim_limiter",
-                   "annotation_limiter", "chat_limiter")
+                   "annotation_limiter", "chat_limiter", "sweep")
+APP_STATE_CALLABLES = ("now", "now_ms")
 
 
 def test_app_state_carries_every_shared_service(app):
@@ -88,6 +104,8 @@ def test_app_state_carries_every_shared_service(app):
     session reach their collaborators through exactly these, so a rename or a
     dropped assignment is a runtime AttributeError deep inside a request rather
     than an import error at boot."""
+    assert set(vars(app.state)["_state"]) == set(APP_STATE_TYPES) | set(
+        APP_STATE_CALLABLES), "app.state carries exactly these names, no more"
     for name, expected in APP_STATE_TYPES.items():
         value = getattr(app.state, name)
         assert isinstance(value, expected), f"app.state.{name} is a {type(value).__name__}"
@@ -278,17 +296,17 @@ def test_an_outdated_request_leaves_the_senders_existing_room_alone(client, app,
     assert app.state.rooms.rooms_active == 1
 
 
-def test_a_refused_build_still_spends_its_per_ip_matchmake_allowance(client):
+def test_a_refused_build_still_spends_its_per_ip_matchmake_allowance(monkeypatch):
     """The limiter decorator sits outside the handler, so a 426 costs the same
     allowance a 200 does. That is the point: refusing outdated builds must not
     hand an attacker an unmetered endpoint to hammer."""
-    budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
+    client = _client_on_a_tiny_matchmake_budget(monkeypatch)
     payload = {
         "version": PROTOCOL_VERSION, "client_uuid": ALICE, "nickname": "Alice",
         "time_minutes": 5, "increment_seconds": 0, "side_preference": "random",
         "client_version": "0.0.1",
     }
-    for _ in range(budget):
+    for _ in range(TINY_BUDGET):
         assert client.post("/matchmake", json=payload).status_code == 426
     limited = client.post("/matchmake", json=payload)
     assert limited.status_code == 429
@@ -572,14 +590,14 @@ def test_shutdown_logs_the_load_it_was_carrying(app, caplog):
         assert ws.line_logged_first is True, "the line must precede the teardown"
 
 
-def test_cancel_matchmake_is_rate_limited_per_ip(client):
+def test_cancel_matchmake_is_rate_limited_per_ip(monkeypatch):
     """SECURITY: DELETE /matchmake was the one public endpoint with no per-IP
     limiter, so it was a free unauthenticated way to hammer the room manager's
     lock. It now shares the matchmake budget and answers 429 past it."""
-    budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
+    client = _client_on_a_tiny_matchmake_budget(monkeypatch)
     payload = {"version": PROTOCOL_VERSION, "room_id": fake_uuid4(77),
                "session_token": "t"}
-    for _ in range(budget):
+    for _ in range(TINY_BUDGET):
         assert client.request("DELETE", "/matchmake", json=payload).status_code == 404
     limited = client.request("DELETE", "/matchmake", json=payload)
     assert limited.status_code == 429
@@ -595,13 +613,16 @@ def test_search_and_cancel_share_one_matchmake_budget(client):
     budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
     payload = {"version": PROTOCOL_VERSION, "room_id": fake_uuid4(77),
                "session_token": "t"}
+    started = time.monotonic()
     for _ in range(budget - 1):
         assert client.request("DELETE", "/matchmake", json=payload).status_code == 404
     assert _matchmake(client, uuid=ALICE).status_code == 200
     assert _matchmake(client, uuid=BOB).status_code == 429
+    assert time.monotonic() - started < RATE_LIMIT_WINDOW_SECONDS, \
+        "the whole budget has to be spent inside one window or the 429 proves nothing"
 
 
-def test_two_apps_never_share_a_per_ip_matchmake_budget(client):
+def test_two_apps_never_share_a_per_ip_matchmake_budget(monkeypatch):
     """The per-IP limiter is a `Limiter` built inside create_app and bound by the
     @limiter.limit decorator, so its allowance belongs to ONE application. If the
     decorator ever closed over a module-level limiter instead, every test app in
@@ -609,10 +630,10 @@ def test_two_apps_never_share_a_per_ip_matchmake_budget(client):
     failing in whichever order it happened to run.
 
     The fill uses a single uuid on purpose: each POST releases the caller's own
-    queue slot before enqueueing again, so 60 searches spend 60 allowance without
+    queue slot before enqueueing again, so the searches spend allowance without
     ever holding more than one room."""
-    budget = int(MATCHMAKE_PER_IP_LIMIT.split("/")[0])
-    for _ in range(budget):
+    client = _client_on_a_tiny_matchmake_budget(monkeypatch)
+    for _ in range(TINY_BUDGET):
         assert _matchmake(client, uuid=ALICE).status_code == 200
     limited = _matchmake(client, uuid=ALICE)
     assert limited.status_code == 429
@@ -1097,11 +1118,7 @@ def test_invalid_move_format_rejected(client):
 async def test_first_move_timeout_aborts_room(app, clock):
     random.seed(0)
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(rooms)
     room.started_at = clock()
     clock.advance(FIRST_MOVE_ABORT_SECONDS + 1)
     await _sweep(app)
@@ -1112,11 +1129,7 @@ async def test_first_move_timeout_aborts_room(app, clock):
 async def test_clock_flag_during_play_broadcasts_timeout(app, clock):
     random.seed(0)
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=1, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=1, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(rooms, time_minutes=1)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 1
@@ -1128,11 +1141,7 @@ async def test_clock_flag_during_play_broadcasts_timeout(app, clock):
 
 @pytest.mark.asyncio
 async def _paired_in_progress_room(rooms, clock):
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.white.connected = True
@@ -1309,11 +1318,7 @@ async def test_resume_ticks_clock_before_snapshotting(app, client, clock):
     return the pre-advance white_remaining)."""
     random.seed(0)
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     initial_white = room.backend.clock.white_remaining
@@ -1331,11 +1336,7 @@ async def test_resume_ticks_clock_before_snapshotting(app, client, clock):
 
 async def _resumable_room(app, clock):
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
-    room = list(rooms._active.values())[0]
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     return room
@@ -1426,10 +1427,7 @@ async def test_reclaim_closes_a_still_registered_old_socket(app, client):
     working on the rotated-out session token."""
     rooms = app.state.rooms
     connections = app.state.connections
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0, side_preference="black")
+    room = await pair_room(rooms)
     old_ws = _FakeOldSocket()
     connections.add(room.room_id, ALICE, old_ws)
 
@@ -1488,10 +1486,7 @@ def test_runner_app_factory_builds_a_real_app(monkeypatch):
 @pytest.mark.asyncio
 async def test_reclaim_with_no_live_socket_is_a_clean_noop(app, client):
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=5, increment_seconds=0, side_preference="black")
+    await pair_room(rooms)
 
     r = client.post("/reclaim", json={"version": PROTOCOL_VERSION, "client_uuid": ALICE})
 
@@ -1523,6 +1518,7 @@ async def test_the_housekeeping_loop_keeps_ticking_after_a_pass_raises(
     task.cancel()
     await asyncio.wait([task], timeout=1)
 
+    assert task.done(), "the loop returned rather than hanging past the timeout"
     assert len(passes) >= 3, "one failed pass must not end the loop"
     assert sweep.failure_count >= 3
     assert isinstance(sweep._last_failure, RuntimeError)

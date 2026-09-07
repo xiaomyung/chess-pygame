@@ -31,6 +31,7 @@ SERVER_ROOT = os.path.join(PACKAGE_ROOT, "server")
 SERVER_LOG_MODULES = ("app", "broadcasts", "connections", "handlers", "limits",
                       "protocol", "routes_http", "sweep", "ws_session")
 LOUD_LEVELS = ("info", "warning")
+LOUD_LOGGER_NAMES = ("log", "logger")
 KV_TOKEN_RE = re.compile(r"(?:^|[\s(])([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
 
 PREFIX_ONLY_TEMPLATES = {
@@ -149,7 +150,12 @@ def test_configure_file_handler_follows_log_file_env(tmp_path, monkeypatch,
 
 def _loud_templates_in_source(path):
     """Every INFO/WARNING format string in one file, read off the AST so a
-    literal inside a docstring or a data table can never be mistaken for one."""
+    literal inside a docstring or a data table can never be mistaken for one.
+
+    A loud call whose first argument is not a string literal -- an f-string, or a
+    message built before the call -- RAISES here rather than being skipped. A
+    skip would drop the line out of the shape check silently, which is the exact
+    way a line escapes this file's guard."""
     tree = ast.parse(read_source_without_docstrings(path), filename=path)
     templates = []
     for node in ast.walk(tree):
@@ -157,18 +163,27 @@ def _loud_templates_in_source(path):
             continue
         if node.func.attr not in LOUD_LEVELS:
             continue
-        if not (isinstance(node.func.value, ast.Name) and node.func.value.id == "log"):
+        if not (isinstance(node.func.value, ast.Name)
+                and node.func.value.id in LOUD_LOGGER_NAMES):
             continue
-        if node.args and isinstance(node.args[0], ast.Constant) \
-                and isinstance(node.args[0].value, str):
-            templates.append(node.args[0].value)
+        first = node.args[0] if node.args else None
+        assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+            f"{path}:{node.lineno}: a loud log call takes a literal % template, "
+            "never an f-string or a pre-built message"
+        )
+        templates.append(first.value)
     return templates
 
 
 def _loud_templates(module_name):
+    """The loud templates of one server module, and never an empty list: a module
+    that logs through a differently named logger, or only through f-strings,
+    would otherwise pass every check below by having nothing to check."""
     module = importlib.import_module(f"chessshootout.server.{module_name}")
     assert module.__file__ is not None
-    return _loud_templates_in_source(module.__file__)
+    templates = _loud_templates_in_source(module.__file__)
+    assert templates, f"server/{module_name}.py emits no INFO/WARNING lines any more"
+    return templates
 
 
 @pytest.mark.parametrize("module_name", SERVER_LOG_MODULES)
@@ -177,9 +192,7 @@ def test_server_info_and_warning_lines_keep_the_kv_shape(module_name):
     no `=`, then `key=value` pairs. The prefix rule is what keeps a line
     greppable by its subject (`grep 'matchmake rejected'`) and the pairs are what
     keep it parseable by field."""
-    templates = _loud_templates(module_name)
-    assert templates, f"server/{module_name}.py emits no INFO/WARNING lines any more"
-    for template in templates:
+    for template in _loud_templates(module_name):
         first = KV_TOKEN_RE.search(template)
         if first is None:
             assert (module_name, template) in PREFIX_ONLY_TEMPLATES, (

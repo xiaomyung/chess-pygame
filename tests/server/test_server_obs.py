@@ -22,8 +22,7 @@ from chessshootout.server.protocol import (
 from chessshootout.server.limits import WS_MESSAGES_PER_SECOND
 from chessshootout.server.ws_session import _ws_session
 from chessshootout.server.sweep import PREGAME_CONNECT_GRACE_SECONDS
-from tests.server.conftest import ALICE, BOB, auth_msg
-from tests.server.test_server_broadcasts import RecordingWS
+from tests.server.conftest import ALICE, BOB, RecordingWS, auth_msg, pair_room
 
 
 def _matchmake(client, *, uuid, side):
@@ -212,11 +211,7 @@ def _msg(**fields):
 async def _wired_room(app):
     """A paired room with both sockets filed, the shape every ending starts from."""
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms)
     ws_w, ws_b = RecordingWS(), RecordingWS()
     app.state.connections.add(room.room_id, room.white.client_uuid, ws_w)
     app.state.connections.add(room.room_id, room.black.client_uuid, ws_b)
@@ -268,11 +263,7 @@ async def _end_by_accepted_draw_response(app, clock):
 
 async def _end_by_flag_fall(app, clock):
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=1, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=1, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms, time_minutes=1)
     app.state.connections.add(room.room_id, room.white.client_uuid, RecordingWS())
     app.state.connections.add(room.room_id, room.black.client_uuid, RecordingWS())
     room.plies_ever = 1
@@ -366,7 +357,9 @@ async def test_no_ending_still_logs_one_of_the_replaced_lines(
     the funnel line they would double-report every ending, which is exactly the
     noise the funnel exists to remove."""
     with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
-        await drive(app, clock)
+        room = await drive(app, clock)
+    assert room.result is not None, \
+        "the driver has to actually end the game, or an empty log proves nothing"
     stale = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith(REMOVED_GAME_END_PREFIXES)]
     assert stale == []
@@ -411,11 +404,7 @@ async def test_unexpected_ws_recv_failure_logs_a_traceback(app, caplog):
     level an operator alerts on. An exception nobody anticipated is exactly the
     case where the traceback IS the diagnosis."""
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms)
     ws = _ExplodingWS([json.dumps(auth_msg("ta"))])
 
     with caplog.at_level(logging.DEBUG, logger="chess.server.app"):
@@ -440,11 +429,7 @@ async def test_the_pre_game_orphan_drop_ends_a_room_without_finalizing_it(
     was. (The other is the shutdown frame, which tells live sockets the process is
     going down without touching any room's result; pinned in test_server_app.)"""
     rooms = app.state.rooms
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=5, increment_seconds=0, side_preference="white")
-    room = await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                               time_minutes=5, increment_seconds=0,
-                               side_preference="black")
+    room = await pair_room(rooms)
     clock.advance(PREGAME_CONNECT_GRACE_SECONDS + 1)
 
     with caplog.at_level(logging.INFO, logger="chess.server.app"):

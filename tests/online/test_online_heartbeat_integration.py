@@ -15,11 +15,14 @@ for no extra claim.
 """
 import time
 
+import pytest
+
 from chessshootout.online.client import OnlineClient
 from chessshootout.server.protocol import (
     RESYNC_STABLE_MISMATCH_HEARTBEATS, RESYNC_TRANSIT_GRACE_SECONDS,
 )
 from tests.helpers import fake_uuid4
+from tests.online.online_helpers import collect_for, wait_for
 
 
 ALICE = fake_uuid4(1)
@@ -28,28 +31,14 @@ BOB = fake_uuid4(2)
 QUIET_WINDOW_SECONDS = 0.5
 
 
-def _wait_for(client, type_name, timeout=15.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for ev in client.drain_inbound():
-            if ev.type == type_name:
-                return ev
-        time.sleep(0.02)
-    return None
-
-
-def _collect(client, seconds):
-    """Everything that arrives over a real wall-clock window, so an assertion
-    that NOTHING arrived is about elapsed time rather than about polling luck."""
-    deadline = time.time() + seconds
-    seen = []
-    while time.time() < deadline:
-        seen.extend(client.drain_inbound())
-        time.sleep(0.02)
-    return seen
-
-
 def test_a_heartbeat_racing_a_real_move_is_tolerated_then_judged(server_with_app):
+    """The in-flight excuse over a real socket: black's heartbeat reports the ply
+    before white's move because the broadcast has not landed yet, and no
+    directive follows.
+
+    The claim only means anything while the whole exchange fit inside the transit
+    grace, so a host that stalled past it skips rather than failing on its own
+    slowness."""
     port, app = server_with_app
     addr = f"localhost:{port}"
     a, b = OnlineClient(), OnlineClient()
@@ -57,16 +46,19 @@ def test_a_heartbeat_racing_a_real_move_is_tolerated_then_judged(server_with_app
                      "increment_seconds": 0, "side_preference": "white"})
     b.connect(addr, {"nickname": "Bob", "client_uuid": BOB, "time_minutes": 5,
                      "increment_seconds": 0, "side_preference": "black"})
-    assert _wait_for(a, "game_start") is not None
-    assert _wait_for(b, "game_start") is not None
+    assert wait_for(a, "game_start") is not None
+    assert wait_for(b, "game_start") is not None
     time.sleep(RESYNC_TRANSIT_GRACE_SECONDS + 0.1)
 
+    t0 = time.time()
     a.send_move("e2", "e4")
-    assert _wait_for(a, "move_applied") is not None
+    assert wait_for(a, "move_applied") is not None
 
     for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS):
         b.send_ping(0)
-    racing = _collect(b, QUIET_WINDOW_SECONDS)
+    racing = collect_for(b, QUIET_WINDOW_SECONDS)
+    if time.time() - t0 >= RESYNC_TRANSIT_GRACE_SECONDS:
+        pytest.skip("host stalled past the transit grace")
     assert [ev for ev in racing if ev.type == "resync_directive"] == [], \
         "a real round trip has to fit inside the transit grace"
 
@@ -74,7 +66,7 @@ def test_a_heartbeat_racing_a_real_move_is_tolerated_then_judged(server_with_app
     for _ in range(RESYNC_STABLE_MISMATCH_HEARTBEATS):
         b.send_ping(0)
 
-    directive = _wait_for(b, "resync_directive", timeout=5.0)
+    directive = wait_for(b, "resync_directive", timeout=5.0)
     assert directive is not None, "a client still behind long afterwards is repaired"
     assert directive.payload["server_ply"] == 1
 

@@ -37,7 +37,8 @@ this file.
 
 Every def -- dunders, properties, nested closures -- and every class in
 `chessshootout/` (plus the shared test infra: `tests/helpers.py`, the root and
-server `conftest.py`, `tests/frontend/focus_helpers.py`) carries a reST
+server `conftest.py`, `tests/frontend/focus_helpers.py`,
+`tests/online/online_helpers.py`) carries a reST
 docstring and a fully annotated signature. `tests/infra/test_docstring_guard.py`
 enforces the shape and `mypy` (strict, gated in CI) enforces the types, so a
 regression fails the build.

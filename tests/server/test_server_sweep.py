@@ -21,19 +21,9 @@ from chessshootout.server.rooms import POST_GAME_DISCONNECT_GRACE, QUEUE_ABANDON
 from chessshootout.server.sweep import (
     PREGAME_CONNECT_GRACE_SECONDS, SWEEP_ERROR_LOG_INTERVAL_SECONDS,
     SWEEP_STALE_SECONDS)
-from tests.server.test_server_broadcasts import RecordingWS
 from tests.helpers import FakeClock, fake_uuid4
-from tests.server.conftest import ALICE, APP_KEY, BOB, clean_sweep
-
-
-async def _pair(rooms, time_minutes=5):
-    await rooms.enqueue(client_uuid=ALICE, nickname="A", session_token="ta",
-                        time_minutes=time_minutes, increment_seconds=0,
-                        side_preference="white")
-    await rooms.enqueue(client_uuid=BOB, nickname="B", session_token="tb",
-                        time_minutes=time_minutes, increment_seconds=0,
-                        side_preference="black")
-    return list(rooms._active.values())[0]
+from tests.server.conftest import (
+    ALICE, APP_KEY, RecordingWS, assert_sweep_clean, pair_room)
 
 
 @pytest.fixture
@@ -74,7 +64,7 @@ async def test_sweep_step_clock_and_idle_windows(sweep, app, clock, time_minutes
     idle window is also due-ish: expected differs in kind per case, so each
     carries its own expected — never flattened.
     """
-    room = await _pair(app.state.rooms, time_minutes=time_minutes)
+    room = await pair_room(app.state.rooms, time_minutes=time_minutes)
     room.started_at = clock()
     room.plies_ever = plies_ever
     if set_first_move:
@@ -99,7 +89,7 @@ async def test_a_flag_in_the_same_tick_beats_the_idle_resign(sweep, app, clock):
     finalize_result is idempotent anyway, but the re-check makes the tie-break
     intentional — a bullet game where white idles to death on the clock is a
     TIMEOUT, not an idle resignation."""
-    room = await _pair(app.state.rooms, time_minutes=1)
+    room = await pair_room(app.state.rooms, time_minutes=1)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 2
@@ -120,7 +110,7 @@ async def test_a_bullet_flag_before_the_ply_one_abort_deadline_is_a_timeout(
     replying to white's first move flags on the clock branch before the idle
     branch gets a look: a real TIMEOUT with a series point for white, not a
     no-fault abort."""
-    room = await _pair(app.state.rooms, time_minutes=1)
+    room = await pair_room(app.state.rooms, time_minutes=1)
     room.started_at = clock()
     assert room.backend.try_move(Square(6, 4), Square(4, 4)).legal
     room.first_move_at = clock()
@@ -143,7 +133,7 @@ async def test_no_idle_resignation_while_the_would_be_winner_is_disconnected(
     is disconnected and leaves the room to the grace sweep, where abandonment
     awards the CONNECTED player: white, the idler."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 2
@@ -163,7 +153,7 @@ async def test_the_idle_resign_beats_a_same_pass_grace_abandonment(sweep, app, c
     idler who also disconnected at window start forfeits by RESIGNATION, not
     ABANDONMENT — deterministic, and both reasons would name the same winner."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 2
@@ -181,7 +171,7 @@ async def test_a_disconnect_does_not_dodge_the_idle_window(sweep, app, clock):
     pauses nor resets the idle window. No /resume happened, nothing restamped
     idle_since, and the forfeit still lands on schedule."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 2
@@ -202,7 +192,7 @@ async def test_the_black_never_moved_abort_beats_a_same_tick_abandonment(sweep, 
     grace would — step order makes the ABORTED outcome win, so nobody gets a
     winner and nobody scores a series point off a game that never started."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 1
@@ -217,7 +207,7 @@ async def test_the_black_never_moved_abort_beats_a_same_tick_abandonment(sweep, 
 
 @pytest.mark.asyncio
 async def test_sweep_step_grace_expired_without_desync_awards_opponent(sweep, app, clock):
-    room = await _pair(app.state.rooms)
+    room = await pair_room(app.state.rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 1
@@ -232,7 +222,7 @@ async def test_sweep_step_grace_expired_without_desync_awards_opponent(sweep, ap
 async def test_sweep_step_grace_expired_with_desync_awards_opponent(sweep, app, clock):
     """See test_server_app: the desync flag never downgrades an abandonment win
     once moves were played; zero-ply games abort via finalize_result instead."""
-    room = await _pair(app.state.rooms)
+    room = await pair_room(app.state.rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 1
@@ -251,7 +241,7 @@ async def test_post_game_leaver_grace_restarts_at_the_result(sweep, app, clock):
     client tore the session down instantly. finalize_result now restamps a
     disconnected slot's clock to ended_at: the post-game window gets its full
     grace measured from the result, not from the original disconnect."""
-    room = await _pair(app.state.rooms)
+    room = await pair_room(app.state.rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.plies_ever = 1
@@ -291,7 +281,7 @@ async def test_sweep_step_grace_expired_revalidates_a_reconnect_that_lands_mid_p
     rooms = app.state.rooms
     connections = app.state.connections
 
-    room_a = await _pair(rooms)
+    room_a = await pair_room(rooms)
     room_a.started_at = clock()
     room_a.first_move_at = clock()
     room_a.plies_ever = 1
@@ -334,7 +324,7 @@ async def test_sweep_step_drop_orphans_pre_game(sweep, app, clock):
     """A paired pre-game room with no live ws survives within the connect
     grace (so client ws handshakes can still land) and is dropped past it."""
     rooms = app.state.rooms
-    await _pair(rooms)
+    await pair_room(rooms)
     assert rooms.rooms_active == 1
     sweep.step_drop_orphans_pre_game()
     assert rooms.rooms_active == 1
@@ -348,7 +338,7 @@ async def test_sweep_step_drop_orphans_skips_after_first_move(sweep, app, clock)
     """After the first move a missing connection starts the grace timer
     instead of dropping the room immediately."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.first_move_at = clock()
     sweep.step_drop_orphans_pre_game()
     assert rooms.rooms_active == 1
@@ -473,7 +463,7 @@ async def test_the_hard_ttl_reap_needs_no_socket_and_leaves_paired_rooms_alone(
     orphan = await rooms.enqueue(client_uuid=fake_uuid4(91), nickname="Q",
                                  session_token="tq", time_minutes=3,
                                  increment_seconds=0, side_preference="white")
-    paired = await _pair(rooms, time_minutes=10)
+    paired = await pair_room(rooms, time_minutes=10)
     paired.first_move_at = clock()
     clock.advance(QUEUE_MAX_WAIT_SECONDS + 1)
 
@@ -490,7 +480,7 @@ async def test_sweep_reap_leaves_paired_rooms_alone(sweep, app, clock):
     queued room it grew from, so an active game that outlives the TTL must be
     untouched."""
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     clock.advance(QUEUE_ABANDON_SECONDS * 10)
@@ -502,7 +492,7 @@ async def test_sweep_reap_leaves_paired_rooms_alone(sweep, app, clock):
 @pytest.mark.asyncio
 async def test_heartbeat_timeout_marks_disconnected(sweep, app, clock):
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.white.connected = True
@@ -516,7 +506,7 @@ async def test_heartbeat_timeout_marks_disconnected(sweep, app, clock):
 @pytest.mark.asyncio
 async def test_heartbeat_timeout_ignores_fresh_pings(sweep, app, clock):
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.first_move_at = clock()
     room.white.connected = True
@@ -529,7 +519,7 @@ async def test_heartbeat_timeout_ignores_fresh_pings(sweep, app, clock):
 @pytest.mark.asyncio
 async def test_heartbeat_timeout_skips_pre_first_move_and_finished(sweep, app, clock):
     rooms = app.state.rooms
-    room = await _pair(rooms)
+    room = await pair_room(rooms)
     room.started_at = clock()
     room.white.connected = True
     room.white.last_seen = clock()
@@ -740,13 +730,10 @@ def test_the_clean_sweep_teardown_check_catches_a_swallowed_failure(
     node = SimpleNamespace(stash={APP_KEY: app} if stashed else {})
     request = SimpleNamespace(fixturenames=fixturenames, node=node)
 
-    gen = clean_sweep._get_wrapped_function()(request)
-    next(gen)
     if not expect_raise:
-        with pytest.raises(StopIteration):
-            gen.send(None)
+        assert_sweep_clean(request)
         return
     with pytest.raises(AssertionError) as excinfo:
-        gen.send(None)
+        assert_sweep_clean(request)
     assert "swallowed 1 failure" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
